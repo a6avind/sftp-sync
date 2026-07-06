@@ -18,14 +18,12 @@ fn be(e: impl std::fmt::Display) -> SyncError {
     SyncError::backend(e)
 }
 
-/// How to authenticate the SSH connection in [`SftpFs::connect`].
 pub enum Auth {
     Password(String),
     /// OpenSSH/PEM private-key file, with optional passphrase.
     KeyFile { path: std::path::PathBuf, passphrase: Option<String> },
 }
 
-/// How [`SftpFs::connect`] decides whether to trust the server's host key.
 pub enum HostKey {
     /// The server's `SHA256:…` fingerprint (`ssh-keygen -lf` / `known_hosts`);
     /// connection refused on mismatch.
@@ -56,9 +54,9 @@ pub struct SftpFs {
 }
 
 impl SftpFs {
-    /// Wrap an established [`SftpSession`]. `keepalive` owns the transport (e.g.
-    /// the russh `Handle`) and is held for the [`SftpFs`]'s lifetime so the
-    /// connection stays open. Use for custom transport/auth/host-key handling.
+    /// Wrap an established [`SftpSession`], for custom transport/auth/host-key
+    /// handling. `keepalive` owns the transport (e.g. the russh `Handle`) and is
+    /// held for the [`SftpFs`]'s lifetime to keep the connection open.
     pub fn from_session(sftp: SftpSession, keepalive: impl Send + Sync + 'static) -> Self {
         SftpFs { sftp, keepalive: Box::new(keepalive) }
     }
@@ -131,9 +129,8 @@ impl RemoteFs for SftpFs {
     }
 
     async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
-        // SFTP v3 sends atime+mtime as one unit; set both so a one-sided write
-        // never zeroes atime to 1970. Clamp negatives (pre-epoch) to 0 rather than
-        // letting `as u32` wrap them to a year-2106 timestamp.
+        // atime+mtime travel as one unit; set both so a one-sided write never
+        // zeroes atime to 1970. Clamp pre-epoch to 0, else `as u32` wraps it to 2106.
         let secs = mtime.max(0) as u32;
         let mut attrs = FileAttributes::empty();
         attrs.atime = Some(secs);

@@ -22,17 +22,14 @@ type SftpResult<T> = Result<T, Error>;
 pub mod error {
     use super::super::protocol::Status;
 
-    /// Client-side SFTP error.
     #[derive(Debug)]
     pub enum Error {
         Io(std::io::Error),
         /// Malformed or unexpected packet from the server.
         Protocol(String),
-        /// The server returned a non-OK status.
         Status(Status),
         /// The server does not implement the requested operation/extension.
         Unsupported(String),
-        /// The channel closed before the reply arrived.
         ConnectionLost,
     }
 
@@ -179,12 +176,10 @@ impl SftpSession {
         self.expect_handle(id, b.0).await
     }
 
-    /// Open a file for reading.
     pub async fn open(&self, path: &str) -> SftpResult<fs::File> {
         self.open_with_flags(path, OpenFlags::READ).await
     }
 
-    /// Open a file with explicit flags.
     pub async fn open_with_flags(&self, path: &str, flags: OpenFlags) -> SftpResult<fs::File> {
         let handle = self.open_handle(path, flags).await?;
         Ok(fs::File::new(self.clone(), handle))
@@ -227,8 +222,7 @@ impl SftpSession {
         self.expect_status(id, b.0).await
     }
 
-    /// List a directory. Each [`DirEntry`] remembers `path` so
-    /// [`DirEntry::path`] yields the child's full path.
+    /// List a directory; each [`DirEntry`] carries its parent for [`DirEntry::path`].
     pub async fn read_dir(&self, path: &str) -> SftpResult<ReadDir> {
         let handle = {
             let id = self.next_id();
@@ -268,7 +262,6 @@ impl SftpSession {
         Ok(ReadDir(entries.into_iter()))
     }
 
-    /// Set a path's attributes (`SSH_FXP_SETSTAT`).
     pub async fn set_metadata(&self, path: &str, attrs: FileAttributes) -> SftpResult<()> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::SETSTAT, id);
@@ -277,7 +270,7 @@ impl SftpSession {
         self.expect_status(id, b.0).await
     }
 
-    /// Attributes of `path`, following symlinks (`SSH_FXP_STAT`).
+    /// Attributes of `path`, following symlinks.
     pub async fn metadata(&self, path: &str) -> SftpResult<FileAttributes> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::STAT, id);
@@ -285,7 +278,7 @@ impl SftpSession {
         self.expect_attrs(id, b.0).await
     }
 
-    /// Attributes of `path`, not following symlinks (`SSH_FXP_LSTAT`).
+    /// Attributes of `path`, not following symlinks.
     pub async fn symlink_metadata(&self, path: &str) -> SftpResult<FileAttributes> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::LSTAT, id);
@@ -332,7 +325,7 @@ impl SftpSession {
         self.expect_status(id, b.0).await
     }
 
-    /// Resolve `path` to an absolute path (`SSH_FXP_REALPATH`).
+    /// Resolve `path` to an absolute path.
     pub async fn canonicalize(&self, path: &str) -> SftpResult<String> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::REALPATH, id);
@@ -345,7 +338,6 @@ impl SftpSession {
             .ok_or_else(|| proto_err("empty NAME for realpath"))
     }
 
-    /// Read a symlink's target (`SSH_FXP_READLINK`).
     pub async fn read_link(&self, path: &str) -> SftpResult<String> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::READLINK, id);
@@ -408,9 +400,8 @@ async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, inner: Arc<Inner>) {
             Ok(b) => b,
             Err(_) => break,
         };
-        // Extract the id up front so a malformed body for a *known* request still
-        // wakes its waiter with an error instead of leaving it hung until the
-        // connection drops.
+        // Recover the id first so a malformed body still wakes its waiter with an
+        // error rather than hanging it until the connection drops.
         let mut head = Cursor::new(&body);
         let (Ok(_ty), Ok(id)) = (head.u8(), head.u32()) else { continue };
         if let Some((_, tx)) = inner.pending.remove(&id) {
@@ -450,9 +441,8 @@ fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
         fxp::EXTENDED_REPLY => Reply::Extended(cur.rest().to_vec()),
         fxp::NAME => {
             let count = cur.u32().ok()?;
-            // A malicious `count` (e.g. 0xFFFFFFFF) would preallocate hundreds of
-            // GiB; cap the reservation and let the loop grow it as entries actually
-            // decode (a truncated packet fails the `?` below well before then).
+            // Cap the reservation: a hostile `count` (e.g. 0xFFFFFFFF) would else
+            // preallocate hundreds of GiB. The loop grows it as entries decode.
             let mut files = Vec::with_capacity((count as usize).min(1024));
             for _ in 0..count {
                 let filename = cur.string().ok()?;
@@ -467,8 +457,8 @@ fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
     Some((id, reply))
 }
 
-/// One entry from [`SftpSession::read_dir`], carrying its parent directory so
-/// [`path`](DirEntry::path) can return the child's full path.
+/// One directory entry, carrying its parent so [`path`](DirEntry::path) can
+/// return the child's full path.
 pub struct DirEntry {
     dir: String,
     file: NameFile,
@@ -484,14 +474,13 @@ impl DirEntry {
     pub fn metadata(&self) -> FileAttributes {
         self.file.attrs
     }
-    /// Full path: the directory passed to `read_dir` joined with the file name.
+    /// Parent directory joined with the file name.
     pub fn path(&self) -> String {
         let base = self.dir.trim_end_matches('/');
         format!("{base}/{}", self.file.filename)
     }
 }
 
-/// Iterator over a directory listing.
 pub struct ReadDir(std::vec::IntoIter<DirEntry>);
 
 impl Iterator for ReadDir {
@@ -511,17 +500,15 @@ pub mod fs {
 
     use super::{Error, SftpSession};
 
-    /// Attributes of a remote file — the same type as
-    /// [`protocol::FileAttributes`](super::super::protocol::FileAttributes).
     pub type Metadata = super::super::protocol::FileAttributes;
 
     const MAX_CHUNK: usize = 32 * 1024;
 
     type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send>>;
 
-    /// A remote file handle. Implements [`AsyncRead`]/[`AsyncWrite`]/[`AsyncSeek`].
-    /// Call `shutdown` to close with an awaited CLOSE; on drop without shutdown a
-    /// background task closes the handle so it is never leaked.
+    /// A remote file handle (`AsyncRead`/`AsyncWrite`/`AsyncSeek`). `shutdown`
+    /// awaits an explicit CLOSE; dropping without it spawns a background CLOSE so
+    /// the handle is never leaked.
     pub struct File {
         session: SftpSession,
         handle: String,
@@ -625,8 +612,8 @@ pub mod fs {
             match Pin::new(fut).poll(cx) {
                 Poll::Ready(res) => {
                     this.close_op = None;
-                    // Only mark closed on success — a failed CLOSE leaves the
-                    // handle live, so `Drop` must still get a chance to retire it.
+                    // Mark closed only on success; a failed CLOSE leaves the handle
+                    // live for `Drop` to retire.
                     this.closed = res.is_ok();
                     Poll::Ready(res)
                 }
@@ -637,8 +624,8 @@ pub mod fs {
 
     impl AsyncSeek for File {
         fn start_seek(mut self: Pin<&mut Self>, pos: SeekFrom) -> io::Result<()> {
-            // SFTP addresses every read/write by explicit offset, so a seek is
-            // purely local. `End` needs the size we don't track here.
+            // Every read/write carries an explicit offset, so a seek is local-only.
+            // `End` needs the size we don't track here.
             let new = match pos {
                 SeekFrom::Start(n) => n,
                 SeekFrom::Current(d) => self.offset.saturating_add_signed(d),

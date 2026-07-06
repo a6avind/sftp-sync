@@ -37,8 +37,7 @@ mod sftp;
 #[cfg(feature = "sftp")]
 pub use sftp::{Auth, HostKey, SftpFs};
 
-/// The bundled SFTP client, protocol types, and in-process server. Original
-/// implementation — used by [`SftpFs`], and reusable directly.
+/// The bundled SFTP client, protocol types, and in-process server — reusable directly.
 #[cfg(feature = "sftp")]
 pub use proto::{client, protocol, server};
 
@@ -99,11 +98,10 @@ pub struct RemoteEntry {
 /// engine can run under a multi-thread runtime.
 pub trait RemoteFs {
     fn read_dir(&self, path: &str) -> impl Future<Output = Result<Vec<RemoteEntry>, SyncError>> + Send;
-    /// Open a file for reading.
     fn open_read(&self, path: &str) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin>, SyncError>> + Send;
     /// Create/truncate a file for writing.
     fn create(&self, path: &str) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError>> + Send;
-    /// Set a file's mtime (whole seconds). Best-effort; used to keep synced pairs equal.
+    /// Set a file's mtime (whole seconds). Best-effort; keeps synced pairs equal.
     fn set_mtime(&self, path: &str, mtime: i64) -> impl Future<Output = Result<(), SyncError>> + Send;
     fn remove_file(&self, path: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
     fn rename(&self, from: &str, to: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
@@ -298,11 +296,8 @@ pub async fn sync_once<R: RemoteFs>(
     if opts.dry_run {
         return Ok(Outcome { baseline: baseline.clone(), changed: 0, report });
     }
-    // Advance the baseline only for actions that actually landed. A failed
-    // transfer must leave that path's baseline entry untouched — otherwise a
-    // rescan-based baseline records "local exists, remote doesn't" as synced, and
-    // the next reconcile reads it as a remote-side deletion and deletes the local
-    // file. One flaky push would become permanent data loss.
+    // Advance the baseline only for actions that landed: a path recorded as synced
+    // after a failed transfer reads next cycle as a remote-side delete → local data loss.
     let mut new_base = baseline.clone();
     let mut changed = 0usize;
     for a in &acts {
@@ -452,10 +447,8 @@ pub async fn scan_remote<R: RemoteFs>(fs: &R, base: &str) -> Result<Tree, SyncEr
     while let Some(rel) = stack.pop() {
         let dir = if rel.is_empty() { base.to_string() } else { join(base, &rel) };
         for e in fs.read_dir(&dir).await? {
-            // A backend name is untrusted (a hostile or buggy server can return
-            // `.`, `..`, or `a/../../etc`): joining it unchecked escapes `base`
-            // locally on pull and drives `..` recursion. Reject at the one choke
-            // point every entry passes through.
+            // Untrusted backend name: `.`/`..`/`a/../../etc` joined unchecked escapes
+            // `base` on pull and drives `..` recursion. One choke point for every entry.
             if !is_safe_component(&e.name) {
                 continue;
             }
@@ -475,9 +468,8 @@ pub async fn scan_remote<R: RemoteFs>(fs: &R, base: &str) -> Result<Tree, SyncEr
     Ok(out)
 }
 
-/// A single remote path component is safe to join under the sync root: non-empty,
-/// not `.`/`..`, and free of separators or NUL (which would let a hostile backend
-/// traverse out of the root — see [`scan_remote`]).
+/// A remote path component safe to join under the sync root: non-empty, not `.`/`..`,
+/// no separators or NUL — else a hostile backend traverses out (see [`scan_remote`]).
 fn is_safe_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."

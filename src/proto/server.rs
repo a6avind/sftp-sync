@@ -15,7 +15,6 @@ pub trait Handler: Send + Sized {
     /// Error type; converted to an SFTP status code for the wire reply.
     type Error: Into<StatusCode> + Send;
 
-    /// The error returned by every un-overridden method.
     fn unimplemented(&self) -> Self::Error;
 
     fn realpath(

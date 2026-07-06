@@ -162,7 +162,6 @@ impl FileAttributes {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Modification time, if present.
     pub fn modified(&self) -> Option<SystemTime> {
         self.mtime.map(|s| UNIX_EPOCH + Duration::from_secs(s as u64))
     }
@@ -299,7 +298,6 @@ impl File {
     }
 }
 
-/// `SSH_FXP_STATUS` payload.
 #[derive(Debug)]
 pub struct Status {
     pub id: u32,
@@ -308,31 +306,26 @@ pub struct Status {
     pub language_tag: String,
 }
 
-/// `SSH_FXP_HANDLE` payload.
 pub struct Handle {
     pub id: u32,
     pub handle: String,
 }
 
-/// `SSH_FXP_DATA` payload.
 pub struct Data {
     pub id: u32,
     pub data: Vec<u8>,
 }
 
-/// `SSH_FXP_NAME` payload.
 pub struct Name {
     pub id: u32,
     pub files: Vec<File>,
 }
 
-/// `SSH_FXP_ATTRS` payload.
 pub struct Attrs {
     pub id: u32,
     pub attrs: FileAttributes,
 }
 
-/// Result of the `check-file` extension.
 pub struct CheckFile {
     pub hash_algorithm: String,
     pub hashes: Vec<u8>,

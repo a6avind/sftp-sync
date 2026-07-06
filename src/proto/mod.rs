@@ -1,8 +1,7 @@
 //! A small, self-contained SFTP v3 implementation (client + server) over any
 //! `AsyncRead + AsyncWrite` stream, plus the ProFTPD `check-file` extension.
-//! Original code — the wire format is hand-encoded (no serde). Layout:
-//! [`protocol`] wire types, [`client`] the async client, [`server`] a handler-driven
-//! server used for in-process testing.
+//! Wire format is hand-encoded (no serde). Layout: [`protocol`] wire types,
+//! [`client`] the async client, [`server`] a handler-driven in-process test server.
 
 pub mod client;
 pub mod protocol;
@@ -46,9 +45,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
-    // A peer-supplied length is untrusted: without a cap, `0xFFFFFFFF` forces a
-    // 4 GiB zeroed allocation per packet (OOM DoS). SFTP v3 packets are a few
-    // hundred KB at most; 1 MiB is generous headroom over the 32 KiB data chunks.
+    // Cap the peer-supplied length: uncapped `0xFFFFFFFF` forces a 4 GiB alloc per
+    // packet (OOM DoS). 1 MiB is generous over v3's ~32 KiB data chunks.
     const MAX_PACKET: usize = 1024 * 1024;
     let mut len = [0u8; 4];
     rd.read_exact(&mut len).await?;

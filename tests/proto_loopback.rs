@@ -190,7 +190,6 @@ async fn client_server_roundtrip() {
 
     s.create_dir("/data").await.expect("mkdir");
 
-    // write via the async File handle, then read it back
     let mut f = s.create("/data/hello.txt").await.expect("create");
     f.write_all(b"hello sftp").await.expect("write");
     f.shutdown().await.expect("close");
@@ -200,37 +199,32 @@ async fn client_server_roundtrip() {
     r.read_to_string(&mut got).await.expect("read");
     assert_eq!(got, "hello sftp");
 
-    // stat sees the written size
     let m = s.metadata("/data/hello.txt").await.expect("stat");
     assert_eq!(m.len(), 10);
     assert!(m.is_file());
 
-    // seek + partial read
     let mut r2 = s.open("/data/hello.txt").await.expect("open2");
     r2.seek(std::io::SeekFrom::Start(6)).await.expect("seek");
     let mut tail = String::new();
     r2.read_to_string(&mut tail).await.expect("read tail");
     assert_eq!(tail, "sftp");
 
-    // readdir
     let names: Vec<String> = s.read_dir("/data").await.expect("readdir").map(|e| e.file_name()).collect();
     assert_eq!(names, vec!["hello.txt".to_string()]);
 
-    // setstat with mtime only: the encoder must fill atime from mtime (L117), so
-    // the server sees both — a one-sided send would leave atime unset/zeroed.
+    // setstat with mtime only: the encoder must fill atime from mtime so the
+    // server sees both — a one-sided send would leave atime zeroed.
     let attrs = FileAttributes { mtime: Some(5000), ..FileAttributes::empty() };
     s.set_metadata("/data/hello.txt", attrs).await.expect("setstat");
     let after = s.metadata("/data/hello.txt").await.expect("stat after setstat");
     assert_eq!(after.mtime, Some(5000), "mtime applied");
     assert_eq!(after.atime, Some(5000), "atime filled from mtime, not zeroed");
 
-    // rename + remove
     s.rename("/data/hello.txt", "/data/bye.txt").await.expect("rename");
     assert!(s.metadata("/data/hello.txt").await.is_err());
     assert!(s.metadata("/data/bye.txt").await.is_ok());
     s.remove_file("/data/bye.txt").await.expect("remove");
     assert!(s.metadata("/data/bye.txt").await.is_err());
 
-    // realpath
     assert_eq!(s.canonicalize(".").await.expect("realpath"), "/");
 }

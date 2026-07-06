@@ -11,8 +11,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use sftp_sync::{RemoteEntry, RemoteFs, SyncError};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-// ---- a filesystem-backed RemoteFs (the "remote" is a real dir) --------------
-
 struct LocalFs;
 
 impl RemoteFs for LocalFs {
@@ -107,8 +105,6 @@ impl RemoteFs for HostileFs {
     async fn mkdir(&self, _p: &str) -> Result<(), SyncError> { Ok(()) }
 }
 
-// ---- helpers ----------------------------------------------------------------
-
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -146,8 +142,6 @@ async fn sync(remote: &Path, local: &Path, base: &sftp_sync::Tree, del: bool) ->
     let opts = sftp_sync::SyncOptions { allow_delete: del, ..Default::default() };
     sftp_sync::sync_once(&LocalFs, remote.to_str().unwrap(), local, base, &opts, "testhost").await.unwrap()
 }
-
-// ---- tests ------------------------------------------------------------------
 
 #[tokio::test]
 async fn first_run_unions_both_sides() {

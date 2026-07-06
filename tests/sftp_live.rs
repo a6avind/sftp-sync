@@ -82,13 +82,13 @@ async fn live_sftp_roundtrip() {
 
     let fs = connect(&e, HostKey::Fingerprint(e.fp.clone())).await.expect("connect + host-key verify");
     // Create only the PARENT of the sync root; sync_once must create the root
-    // itself (push-capable directions). Proves the base-dir contract fix.
+    // itself (push-capable directions).
     let base = e.remote_dir.trim_end_matches('/').to_string();
     let remote = format!("{base}/rt-{}", std::process::id());
     fs.mkdir(&base).await.unwrap();
     clean_remote(&fs, &remote).await;
 
-    // 1. First run unions both sides (local file pushed, remote file pulled), no delete.
+    // First run unions both sides (local pushed, remote pulled), no delete.
     let local = local_tmp("l");
     write(&local, "only_local.txt", "L");
     write(&local, "nested/deep.txt", "deep");
@@ -109,11 +109,10 @@ async fn live_sftp_roundtrip() {
     assert_eq!(read(&verify, "only_local.txt").as_deref(), Some("L"), "local push visible remotely");
     assert_eq!(read(&verify, "nested/deep.txt").as_deref(), Some("deep"), "nested dir recreated remotely");
 
-    // 2. Steady state is a no-op — proves mtime is preserved across SFTP (setstat).
+    // Steady state is a no-op — proves mtime is preserved across SFTP (setstat).
     let out2 = sync(&fs, &remote, &local, &out1.baseline, true).await;
     assert_eq!(out2.changed, 0, "clean second pass does nothing (mtime preserved over SFTP)");
 
-    // 3. Local edit pushes.
     write(&local, "only_local.txt", "L2");
     let out3 = sync(&fs, &remote, &local, &out2.baseline, true).await;
     assert!(out3.report.pushed >= 1, "edit pushed");
@@ -121,7 +120,6 @@ async fn live_sftp_roundtrip() {
     sftp_sync::sync_once(&fs, &remote, &verify2, &Tree::new(), &opts, "livehost").await.unwrap();
     assert_eq!(read(&verify2, "only_local.txt").as_deref(), Some("L2"), "edit propagated remotely");
 
-    // 4. Local delete propagates to remote.
     std::fs::remove_file(local.join("only_local.txt")).unwrap();
     sync(&fs, &remote, &local, &out3.baseline, true).await;
     let after = sftp_sync::scan_remote(&fs, &remote).await.unwrap();
