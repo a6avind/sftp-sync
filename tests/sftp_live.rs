@@ -134,7 +134,10 @@ async fn live_sftp_roundtrip() {
 #[cfg(feature = "check-file")]
 #[tokio::test]
 async fn live_check_file_degrades_on_openssh() {
-    let Some(e) = env() else { return };
+    let Some(e) = env() else {
+        eprintln!("SKIP live_check_file_degrades_on_openssh: set SFTP_ADDR/USER/KEY/HOSTKEY_FP/REMOTE_DIR to run");
+        return;
+    };
     let fs = connect(&e, HostKey::Fingerprint(e.fp.clone())).await.expect("connect");
     let base = e.remote_dir.trim_end_matches('/').to_string();
     fs.mkdir(&base).await.unwrap();
@@ -153,7 +156,10 @@ async fn live_check_file_degrades_on_openssh() {
 
 #[tokio::test]
 async fn live_sftp_wrong_fingerprint_is_rejected() {
-    let Some(e) = env() else { return };
+    let Some(e) = env() else {
+        eprintln!("SKIP live_sftp_wrong_fingerprint_is_rejected: set SFTP_ADDR/USER/KEY/HOSTKEY_FP/REMOTE_DIR to run");
+        return;
+    };
     let bogus = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let r = connect(&e, HostKey::Fingerprint(bogus.into())).await;
     assert!(r.is_err(), "connection must be refused on host-key fingerprint mismatch");

@@ -4,7 +4,7 @@ Two-way folder sync between a local directory and any remote, in Rust. Keeps
 **real files on both sides** and reconciles changes each way.
 
 **Backend-agnostic.** The engine talks to the remote through a small `RemoteFs`
-trait (`read_dir` / `open_read` / `create` / `rename` / `remove` / `mkdir` /
+trait (`read_dir` / `open_read` / `create` / `rename` / `remove_file` / `mkdir` /
 `set_mtime`), so it has **no SFTP — or any network — dependency of its own**.
 Point it at SFTP, S3, another local dir, an in-memory fake, whatever. Implement
 ~7 methods over your transport and you're done. (The [flow](https://github.com/a6avind/flow)
@@ -57,7 +57,12 @@ too, if you want to drive the apply step yourself.
 ### Built-in SFTP (optional)
 
 Enable the `sftp` feature for a ready-made `RemoteFs`. Transport is [russh]; the
-SFTP protocol layer is built in — no external SFTP-protocol dependency.
+SFTP v3 protocol layer is an original built-in implementation — no external
+SFTP-protocol dependency. It is also exposed for direct reuse:
+`sftp_sync::{client::SftpSession, protocol, server}` — an async client (seekable
+file handles, `read_dir`, stat/rename/symlink, the `check-file` extension) plus a
+handler-driven in-process server (`server::run` + the `server::Handler` trait),
+useful for tests or loopback. `SftpFs` is the sync-focused wrapper over it.
 
 ```toml
 sftp-sync = { version = "0.1", features = ["sftp"] }

@@ -132,10 +132,12 @@ impl RemoteFs for SftpFs {
 
     async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
         // SFTP v3 sends atime+mtime as one unit; set both so a one-sided write
-        // never zeroes atime to 1970.
+        // never zeroes atime to 1970. Clamp negatives (pre-epoch) to 0 rather than
+        // letting `as u32` wrap them to a year-2106 timestamp.
+        let secs = mtime.max(0) as u32;
         let mut attrs = FileAttributes::empty();
-        attrs.atime = Some(mtime as u32);
-        attrs.mtime = Some(mtime as u32);
+        attrs.atime = Some(secs);
+        attrs.mtime = Some(secs);
         self.sftp.set_metadata(path, attrs).await.map_err(be)?;
         Ok(())
     }

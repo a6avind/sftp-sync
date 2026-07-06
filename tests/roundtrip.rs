@@ -60,6 +60,53 @@ impl RemoteFs for LocalFs {
     }
 }
 
+/// `LocalFs` but every `create` (push write) fails — models a flaky remote.
+struct FailingPush;
+
+impl RemoteFs for FailingPush {
+    async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
+        LocalFs.read_dir(path).await
+    }
+    async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
+        LocalFs.open_read(path).await
+    }
+    async fn create(&self, _path: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        Err(SyncError::backend(std::io::Error::other("push disabled")))
+    }
+    async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
+        LocalFs.set_mtime(path, mtime).await
+    }
+    async fn remove_file(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.remove_file(path).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
+        LocalFs.rename(from, to).await
+    }
+    async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.mkdir(path).await
+    }
+}
+
+/// A hostile backend that injects unsafe directory-entry names.
+struct HostileFs;
+
+impl RemoteFs for HostileFs {
+    async fn read_dir(&self, _path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
+        let bad = |n: &str| RemoteEntry { name: n.into(), is_dir: false, is_symlink: false, mtime: 1, size: 1 };
+        Ok(vec![bad("."), bad(".."), bad("../escape"), bad("a/b"), bad("ok.txt")])
+    }
+    async fn open_read(&self, _p: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
+        Ok(Box::new(&b"x"[..]))
+    }
+    async fn create(&self, _p: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        Ok(Box::new(Vec::new()))
+    }
+    async fn set_mtime(&self, _p: &str, _m: i64) -> Result<(), SyncError> { Ok(()) }
+    async fn remove_file(&self, _p: &str) -> Result<(), SyncError> { Ok(()) }
+    async fn rename(&self, _f: &str, _t: &str) -> Result<(), SyncError> { Ok(()) }
+    async fn mkdir(&self, _p: &str) -> Result<(), SyncError> { Ok(()) }
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -206,4 +253,40 @@ async fn push_only_ignores_remote_side() {
     assert_eq!(read(&remote, "mine.txt").as_deref(), Some("L"), "local pushed");
     assert!(read(&local, "theirs.txt").is_none(), "remote-only NOT pulled");
     assert_eq!(out.report.pulled, 0);
+}
+
+#[tokio::test]
+async fn failed_push_does_not_poison_baseline() {
+    // Regression: a failed transfer must not be recorded as synced. If it were,
+    // the next reconcile would read "local exists, remote doesn't" as a remote
+    // deletion and delete the local file — permanent data loss from one hiccup.
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "keep.txt", "precious", 1000);
+
+    let opts = sftp_sync::SyncOptions::default();
+    let out = sftp_sync::sync_once(&FailingPush, remote.to_str().unwrap(), &local, &sftp_sync::Tree::new(), &opts, "h").await.unwrap();
+    assert!(!out.baseline.contains_key("keep.txt"), "failed push must not enter the baseline");
+
+    // Next run with a working backend + deletes on: the file must be pushed, never deleted.
+    let out2 = sync(&remote, &local, &out.baseline, true).await;
+    assert_eq!(read(&remote, "keep.txt").as_deref(), Some("precious"), "retried push lands");
+    assert_eq!(read(&local, "keep.txt").as_deref(), Some("precious"), "local file survives");
+    assert!(out2.baseline.contains_key("keep.txt"));
+}
+
+#[tokio::test]
+async fn hostile_remote_names_cannot_escape_root() {
+    // `.`/`..`/`../escape`/`a/b` from a hostile backend must be dropped; only the
+    // safe entry survives, and nothing is written outside the local root.
+    let local = tmpdir("l");
+    let canary = local.parent().unwrap().join("ESCAPED");
+    let _ = std::fs::remove_file(&canary);
+
+    let tree = sftp_sync::scan_remote(&HostileFs, "/base").await.unwrap();
+    assert_eq!(tree.keys().cloned().collect::<Vec<_>>(), vec!["ok.txt".to_string()]);
+
+    let opts = sftp_sync::SyncOptions::default();
+    sftp_sync::sync_once(&HostileFs, "/base", &local, &sftp_sync::Tree::new(), &opts, "h").await.unwrap();
+    assert!(!canary.exists(), "no write escaped the local root");
+    assert!(local.join("ok.txt").exists(), "safe file pulled");
 }

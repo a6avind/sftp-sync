@@ -30,17 +30,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-// Macros the `proto` SFTP client expects crate-wide.
-#[cfg(feature = "sftp")]
-#[macro_use]
-extern crate log;
-#[cfg(feature = "sftp")]
-#[macro_use]
-extern crate bitflags;
-#[cfg(feature = "sftp")]
-#[macro_use]
-extern crate serde;
-
 #[cfg(feature = "sftp")]
 mod proto;
 #[cfg(feature = "sftp")]
@@ -48,10 +37,10 @@ mod sftp;
 #[cfg(feature = "sftp")]
 pub use sftp::{Auth, HostKey, SftpFs};
 
-/// The bundled SFTP client + server (a drop-in for the `russh-sftp` crate).
-/// Import `sftp_sync::{client, protocol, server}` in place of `russh_sftp::…`.
+/// The bundled SFTP client, protocol types, and in-process server. Original
+/// implementation — used by [`SftpFs`], and reusable directly.
 #[cfg(feature = "sftp")]
-pub use proto::{client, extensions, protocol, server};
+pub use proto::{client, protocol, server};
 
 /// Everything the sync engine and its backends can fail with.
 #[derive(Debug)]
@@ -309,12 +298,43 @@ pub async fn sync_once<R: RemoteFs>(
     if opts.dry_run {
         return Ok(Outcome { baseline: baseline.clone(), changed: 0, report });
     }
+    // Advance the baseline only for actions that actually landed. A failed
+    // transfer must leave that path's baseline entry untouched — otherwise a
+    // rescan-based baseline records "local exists, remote doesn't" as synced, and
+    // the next reconcile reads it as a remote-side deletion and deletes the local
+    // file. One flaky push would become permanent data loss.
+    let mut new_base = baseline.clone();
+    let mut changed = 0usize;
     for a in &acts {
-        if let Err(e) = apply(fs, base_remote, local_root, a, host, &remote).await {
-            eprintln!("sftp-sync: {a:?} failed: {e}");
+        match apply(fs, base_remote, local_root, a, host, &remote).await {
+            Ok(()) => {
+                commit_baseline(&mut new_base, a, &local, &remote);
+                changed += 1;
+            }
+            Err(e) => eprintln!("sftp-sync: {a:?} failed: {e}"),
         }
     }
-    Ok(Outcome { baseline: scan_local(local_root, opts.git), changed: acts.len(), report })
+    Ok(Outcome { baseline: new_base, changed, report })
+}
+
+/// Fold one successfully-applied action into the running baseline, deriving the
+/// entry from whichever side is now authoritative (never a blind local rescan).
+fn commit_baseline(base: &mut Tree, a: &Action, local: &Tree, remote: &Tree) {
+    match a {
+        Action::Push(rel) => {
+            if let Some(m) = local.get(rel) { base.insert(rel.clone(), *m); }
+        }
+        Action::Pull(rel) => {
+            if let Some(m) = remote.get(rel) { base.insert(rel.clone(), *m); }
+        }
+        Action::DelRemote(rel) | Action::DelLocal(rel) => {
+            base.remove(rel);
+        }
+        Action::Conflict { rel, local_newer } => {
+            let side = if *local_newer { local.get(rel) } else { remote.get(rel) };
+            if let Some(m) = side { base.insert(rel.clone(), *m); }
+        }
+    }
 }
 
 async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, host: &str, remote: &Tree) -> Result<(), SyncError> {
@@ -325,7 +345,11 @@ async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, h
         Action::DelRemote(rel) => fs.remove_file(&join(base, rel)).await,
         Action::DelLocal(rel) => std::fs::remove_file(local_root.join(rel)).map_err(SyncError::from),
         Action::Conflict { rel, local_newer } => {
-            let tag = format!("{rel}.conflict-{host}-{}", now_secs());
+            // Counter suffix: two conflicts on the same path within one wall-clock
+            // second would otherwise share a tag and clobber the first aside-copy.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tag = format!("{rel}.conflict-{host}-{}-{n}", now_secs());
             if *local_newer {
                 pull(fs, base, local_root, rel, &tag, rmtime(rel)).await?; // save remote aside
                 push(fs, base, local_root, rel).await // local wins
@@ -422,22 +446,45 @@ pub fn scan_local(root: &Path, git: bool) -> Tree {
 /// Recursively list the remote tree under `base` via [`RemoteFs`] (files only;
 /// symlinks skipped).
 pub async fn scan_remote<R: RemoteFs>(fs: &R, base: &str) -> Result<Tree, SyncError> {
+    const MAX_DEPTH: usize = 64;
     let mut out = Tree::new();
     let mut stack = vec![String::new()];
     while let Some(rel) = stack.pop() {
         let dir = if rel.is_empty() { base.to_string() } else { join(base, &rel) };
         for e in fs.read_dir(&dir).await? {
+            // A backend name is untrusted (a hostile or buggy server can return
+            // `.`, `..`, or `a/../../etc`): joining it unchecked escapes `base`
+            // locally on pull and drives `..` recursion. Reject at the one choke
+            // point every entry passes through.
+            if !is_safe_component(&e.name) {
+                continue;
+            }
+            if e.is_symlink || is_skippable(&e.name) {
+                continue;
+            }
             let childrel = if rel.is_empty() { e.name.clone() } else { format!("{rel}/{}", e.name) };
             if e.is_dir {
-                stack.push(childrel);
-            } else if e.is_symlink || is_skippable(&childrel) {
-                continue;
+                if childrel.matches('/').count() < MAX_DEPTH {
+                    stack.push(childrel);
+                }
             } else {
                 out.insert(childrel, Meta { mtime: e.mtime, size: e.size });
             }
         }
     }
     Ok(out)
+}
+
+/// A single remote path component is safe to join under the sync root: non-empty,
+/// not `.`/`..`, and free of separators or NUL (which would let a hostile backend
+/// traverse out of the root — see [`scan_remote`]).
+fn is_safe_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 fn is_skippable(rel: &str) -> bool {
