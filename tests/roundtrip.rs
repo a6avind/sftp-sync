@@ -269,6 +269,25 @@ async fn failed_push_does_not_poison_baseline() {
 }
 
 #[tokio::test]
+async fn file_becoming_symlink_does_not_delete_other_side() {
+    // Regression: a synced file replaced by a same-named symlink drops out of the
+    // scan. Without a shadow guard reconcile reads that as a deletion and wipes the
+    // intact, unchanged copy on the other side — permanent data loss.
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "doc.txt", "precious", 1000);
+    let out = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    assert_eq!(read(&remote, "doc.txt").as_deref(), Some("precious"));
+
+    std::fs::remove_file(local.join("doc.txt")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", local.join("doc.txt")).unwrap();
+
+    let out2 = sync(&remote, &local, &out.baseline, true).await;
+    assert_eq!(read(&remote, "doc.txt").as_deref(), Some("precious"), "intact remote file survives");
+    assert_eq!(out2.report.deleted_remote, 0, "no deletion planned for a symlink-shadowed path");
+    assert!(out2.baseline.contains_key("doc.txt"), "baseline keeps the path");
+}
+
+#[tokio::test]
 async fn hostile_remote_names_cannot_escape_root() {
     // `.`/`..`/`../escape`/`a/b` from a hostile backend must be dropped; only the
     // safe entry survives, and nothing is written outside the local root.

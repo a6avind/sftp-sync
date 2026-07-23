@@ -107,9 +107,12 @@ impl RemoteFs for SftpFs {
                 continue;
             }
             let m = e.metadata();
+            // Type via the DirEntry (longname fallback) not the attrs alone, so a
+            // server that omits PERMISSIONS doesn't get every subdir misread as a file.
+            let ft = e.file_type();
             out.push(RemoteEntry {
-                is_dir: m.is_dir(),
-                is_symlink: m.is_symlink(),
+                is_dir: ft.is_dir(),
+                is_symlink: ft.is_symlink(),
                 mtime: m.mtime.unwrap_or(0) as i64,
                 size: m.size.unwrap_or(0),
                 name,

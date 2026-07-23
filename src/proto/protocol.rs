@@ -78,6 +78,16 @@ impl FileType {
             _ => FileType::Other,
         }
     }
+    /// Recover the type from the leading char of an `ls -l`-style longname, for
+    /// servers that omit PERMISSIONS from NAME/READDIR attrs (SFTP v3 optional).
+    fn from_longname(longname: &str) -> Option<Self> {
+        match longname.as_bytes().first()? {
+            b'd' => Some(FileType::Dir),
+            b'l' => Some(FileType::Symlink),
+            b'-' => Some(FileType::File),
+            _ => None,
+        }
+    }
 }
 
 /// SFTP status codes (also the server-side error type in the [`server`] module).
@@ -286,7 +296,13 @@ impl File {
         self.filename.clone()
     }
     pub fn file_type(&self) -> FileType {
-        self.attrs.file_type()
+        let ty = self.attrs.file_type();
+        if ty.is_other() {
+            if let Some(from_ln) = FileType::from_longname(&self.longname) {
+                return from_ln;
+            }
+        }
+        ty
     }
     pub fn metadata(&self) -> FileAttributes {
         self.attrs

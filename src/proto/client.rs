@@ -522,6 +522,21 @@ pub mod fs {
         pub(super) fn new(session: SftpSession, handle: String) -> Self {
             File { session, handle, offset: 0, closed: false, op: None, close_op: None }
         }
+
+        /// Close the remote handle, awaiting the server's CLOSE acknowledgement.
+        ///
+        /// Prefer this over relying on `Drop` when opening many handles
+        /// concurrently through the read API: `Drop` can only fire-and-forget the
+        /// CLOSE (and skips it entirely when no runtime is current), so open
+        /// handles can outpace retirement and trip the server's open-handle limit.
+        pub async fn close(mut self) -> io::Result<()> {
+            if self.closed {
+                return Ok(());
+            }
+            self.closed = true; // stop Drop from issuing a second CLOSE
+            let h = std::mem::take(&mut self.handle);
+            self.session.close(&h).await.map_err(io_err)
+        }
     }
 
     fn io_err(e: Error) -> io::Error {
@@ -549,8 +564,11 @@ pub mod fs {
             match Pin::new(fut).poll(cx) {
                 Poll::Ready(Ok(data)) => {
                     this.op = None;
-                    this.offset += data.len() as u64;
-                    buf.put_slice(&data);
+                    // A hostile/buggy server may reply with more bytes than requested;
+                    // clamp to the caller's buffer instead of letting put_slice panic.
+                    let n = data.len().min(buf.remaining());
+                    this.offset += n as u64;
+                    buf.put_slice(&data[..n]);
                     Poll::Ready(Ok(()))
                 }
                 Poll::Ready(Err(e)) => {

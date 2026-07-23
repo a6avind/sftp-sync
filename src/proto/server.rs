@@ -183,7 +183,13 @@ where
         };
         let reply = match dispatch(&mut handler, &body).await {
             Some(r) => r,
-            None => continue,
+            // Packet too short to even recover a request id: it can't be answered
+            // and its id can't be matched, so continuing would silently wedge that
+            // request forever. Log and close the session instead.
+            None => {
+                eprintln!("sftp-sync server: unparseable request packet, closing session");
+                return Ok(());
+            }
         };
         wr.write_all(&frame(&reply)).await?;
         wr.flush().await?;
@@ -197,6 +203,19 @@ async fn dispatch<H: Handler>(handler: &mut H, body: &[u8]) -> Option<Vec<u8>> {
     let ty = cur.u8().ok()?;
     let id = cur.u32().ok()?;
 
+    // A field parse that fails once the id is known still produces a reply, so the
+    // client's pending request resolves with BadMessage instead of hanging until
+    // the connection drops. `None` is reserved for packets too short to even
+    // recover an id (handled by the caller as a log-and-close).
+    macro_rules! field {
+        ($res:expr) => {
+            match $res {
+                Ok(v) => v,
+                Err(_) => return Some(enc_status(&err_status(id, StatusCode::BadMessage))),
+            }
+        };
+    }
+
     macro_rules! status_reply {
         ($res:expr) => {
             match $res {
@@ -208,108 +227,108 @@ async fn dispatch<H: Handler>(handler: &mut H, body: &[u8]) -> Option<Vec<u8>> {
 
     let reply = match ty {
         fxp::REALPATH => {
-            let path = cur.string().ok()?;
+            let path = field!(cur.string());
             match handler.realpath(id, path).await {
                 Ok(n) => enc_name(&n),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::OPENDIR => {
-            let path = cur.string().ok()?;
+            let path = field!(cur.string());
             match handler.opendir(id, path).await {
                 Ok(h) => enc_handle(&h),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::READDIR => {
-            let handle = cur.string().ok()?;
+            let handle = field!(cur.string());
             match handler.readdir(id, handle).await {
                 Ok(n) => enc_name(&n),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::CLOSE => {
-            let handle = cur.string().ok()?;
+            let handle = field!(cur.string());
             status_reply!(handler.close(id, handle).await)
         }
         fxp::OPEN => {
-            let filename = cur.string().ok()?;
-            let pflags = OpenFlags::from_bits_truncate(cur.u32().ok()?);
-            let attrs = FileAttributes::decode(&mut cur).ok()?;
+            let filename = field!(cur.string());
+            let pflags = OpenFlags::from_bits_truncate(field!(cur.u32()));
+            let attrs = field!(FileAttributes::decode(&mut cur));
             match handler.open(id, filename, pflags, attrs).await {
                 Ok(h) => enc_handle(&h),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::READ => {
-            let handle = cur.string().ok()?;
-            let offset = cur.u64().ok()?;
-            let len = cur.u32().ok()?;
+            let handle = field!(cur.string());
+            let offset = field!(cur.u64());
+            let len = field!(cur.u32());
             match handler.read(id, handle, offset, len).await {
                 Ok(d) => enc_data(&d),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::WRITE => {
-            let handle = cur.string().ok()?;
-            let offset = cur.u64().ok()?;
-            let data = cur.bytes().ok()?;
+            let handle = field!(cur.string());
+            let offset = field!(cur.u64());
+            let data = field!(cur.bytes());
             status_reply!(handler.write(id, handle, offset, data).await)
         }
         fxp::REMOVE => {
-            let filename = cur.string().ok()?;
+            let filename = field!(cur.string());
             status_reply!(handler.remove(id, filename).await)
         }
         fxp::MKDIR => {
-            let path = cur.string().ok()?;
-            let attrs = FileAttributes::decode(&mut cur).ok()?;
+            let path = field!(cur.string());
+            let attrs = field!(FileAttributes::decode(&mut cur));
             status_reply!(handler.mkdir(id, path, attrs).await)
         }
         fxp::RMDIR => {
-            let path = cur.string().ok()?;
+            let path = field!(cur.string());
             status_reply!(handler.rmdir(id, path).await)
         }
         fxp::RENAME => {
-            let oldpath = cur.string().ok()?;
-            let newpath = cur.string().ok()?;
+            let oldpath = field!(cur.string());
+            let newpath = field!(cur.string());
             status_reply!(handler.rename(id, oldpath, newpath).await)
         }
         fxp::STAT => {
-            let path = cur.string().ok()?;
+            let path = field!(cur.string());
             match handler.stat(id, path).await {
                 Ok(a) => enc_attrs(&a),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::LSTAT => {
-            let path = cur.string().ok()?;
+            let path = field!(cur.string());
             match handler.lstat(id, path).await {
                 Ok(a) => enc_attrs(&a),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::FSTAT => {
-            let handle = cur.string().ok()?;
+            let handle = field!(cur.string());
             match handler.fstat(id, handle).await {
                 Ok(a) => enc_attrs(&a),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::SETSTAT => {
-            let path = cur.string().ok()?;
-            let attrs = FileAttributes::decode(&mut cur).ok()?;
+            let path = field!(cur.string());
+            let attrs = field!(FileAttributes::decode(&mut cur));
             status_reply!(handler.setstat(id, path, attrs).await)
         }
         fxp::READLINK => {
-            let path = cur.string().ok()?;
+            let path = field!(cur.string());
             match handler.readlink(id, path).await {
                 Ok(n) => enc_name(&n),
                 Err(e) => enc_status(&err_status(id, e.into())),
             }
         }
         fxp::SYMLINK => {
-            let linkpath = cur.string().ok()?;
-            let targetpath = cur.string().ok()?;
+            let linkpath = field!(cur.string());
+            let targetpath = field!(cur.string());
             status_reply!(handler.symlink(id, linkpath, targetpath).await)
         }
         _ => enc_status(&err_status(id, StatusCode::OpUnsupported)),

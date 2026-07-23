@@ -23,7 +23,7 @@
 //! # }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -287,10 +287,27 @@ pub async fn sync_once<R: RemoteFs>(
     if !opts.dry_run && opts.direction != Direction::PullOnly {
         let _ = fs.mkdir(base_remote).await;
     }
-    let local = scan_local(local_root, opts.git);
-    let remote = scan_remote(fs, base_remote).await?;
+    // Walking a large tree is the single biggest blocking chunk in the cycle;
+    // offload it so it can't stall the runtime thread (and thus the co-located
+    // transport keepalive) on a current-thread executor.
+    let (local, local_sym) = {
+        let root = local_root.to_path_buf();
+        let git = opts.git;
+        tokio::task::spawn_blocking(move || scan_local_shadowed(&root, git))
+            .await
+            .map_err(SyncError::backend)??
+    };
+    let (remote, remote_sym) = scan_remote_shadowed(fs, base_remote).await?;
     let allow = opts.allow_delete && !baseline.is_empty(); // first run never deletes
-    let acts = filter_direction(reconcile(&local, &remote, baseline, allow), opts.direction);
+    let mut acts = filter_direction(reconcile(&local, &remote, baseline, allow), opts.direction);
+    // A path that turned into a symlink drops out of its side's file tree; without
+    // this it looks like a deletion and wipes the intact file on the other side.
+    // The symlink still occupies the path, so suppress the delete (stable no-op).
+    acts.retain(|a| match a {
+        Action::DelLocal(rel) => !remote_sym.contains(rel),
+        Action::DelRemote(rel) => !local_sym.contains(rel),
+        _ => true,
+    });
     let report = Report::tally(&acts);
 
     if opts.dry_run {
@@ -380,11 +397,19 @@ async fn pull<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, src_rel: &str,
     if let Some(parent) = lpath.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Write to a temp path then rename over the target: an interrupted transfer
+    // leaves a `.sync-tmp` (skipped by scans), never a truncated real file that
+    // would reconcile next cycle as the newer side and overwrite the good remote.
+    let mut tmp = lpath.clone().into_os_string();
+    tmp.push(".sync-tmp");
+    let tmp = std::path::PathBuf::from(tmp);
     let mut r = fs.open_read(&rpath).await?;
-    let mut lf = tokio::fs::File::create(&lpath).await?;
+    let mut lf = tokio::fs::File::create(&tmp).await?;
     tokio::io::copy(&mut r, &mut lf).await?;
     lf.flush().await?;
-    set_local_mtime(&lpath, mtime);
+    drop(lf);
+    set_local_mtime(&tmp, mtime);
+    std::fs::rename(&tmp, &lpath)?;
     Ok(())
 }
 
@@ -406,8 +431,17 @@ async fn ensure_remote_dirs<R: RemoteFs>(fs: &R, base: &str, rel: &str) {
 /// Walk `root` and return its files as a [`Tree`]. `git` honours `.gitignore`
 /// (and hidden/global/exclude); else a raw recursive walk. Conflict/temp copies
 /// are skipped so they don't ping-pong.
-pub fn scan_local(root: &Path, git: bool) -> Tree {
+pub fn scan_local(root: &Path, git: bool) -> Result<Tree, SyncError> {
+    Ok(scan_local_shadowed(root, git)?.0)
+}
+
+/// Like [`scan_local`] but also returns the set of paths occupied by a symlink
+/// (rather than a regular file). A symlink is never synced, but its path must
+/// not read as *absent* — that would let reconcile delete the intact file on the
+/// other side. See [`sync_once`].
+fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>), SyncError> {
     let mut out = Tree::new();
+    let mut shadow = BTreeSet::new();
     let walker = ignore::WalkBuilder::new(root)
         .standard_filters(git)
         .hidden(false)
@@ -416,33 +450,49 @@ pub fn scan_local(root: &Path, git: bool) -> Tree {
         .git_exclude(git)
         .parents(git)
         .build();
-    for entry in walker.flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
+    // A dropped walk/metadata error would make an unreadable file vanish from the
+    // tree, which reconcile reads as a remote-side delete → local data loss. Abort.
+    for entry in walker {
+        let entry = entry.map_err(SyncError::backend)?;
+        let Some(ft) = entry.file_type() else { continue };
         let Ok(rel) = entry.path().strip_prefix(root) else { continue };
         let Some(rel) = rel.to_str() else { continue };
         if is_skippable(rel) {
             continue;
         }
-        if let Ok(m) = entry.metadata() {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            out.insert(rel.replace('\\', "/"), Meta { mtime, size: m.len() });
+        let rel = rel.replace('\\', "/");
+        if ft.is_symlink() {
+            shadow.insert(rel);
+            continue;
         }
+        if !ft.is_file() {
+            continue;
+        }
+        let m = entry.metadata().map_err(SyncError::backend)?;
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        out.insert(rel, Meta { mtime, size: m.len() });
     }
-    out
+    Ok((out, shadow))
 }
 
 /// Recursively list the remote tree under `base` via [`RemoteFs`] (files only;
 /// symlinks skipped).
 pub async fn scan_remote<R: RemoteFs>(fs: &R, base: &str) -> Result<Tree, SyncError> {
+    Ok(scan_remote_shadowed(fs, base).await?.0)
+}
+
+/// Like [`scan_remote`] but also returns the set of paths occupied by a symlink.
+/// A symlinked path must not read as absent, or reconcile deletes the intact file
+/// on the other side. See [`sync_once`].
+async fn scan_remote_shadowed<R: RemoteFs>(fs: &R, base: &str) -> Result<(Tree, BTreeSet<String>), SyncError> {
     const MAX_DEPTH: usize = 64;
     let mut out = Tree::new();
+    let mut shadow = BTreeSet::new();
     let mut stack = vec![String::new()];
     while let Some(rel) = stack.pop() {
         let dir = if rel.is_empty() { base.to_string() } else { join(base, &rel) };
@@ -452,20 +502,31 @@ pub async fn scan_remote<R: RemoteFs>(fs: &R, base: &str) -> Result<Tree, SyncEr
             if !is_safe_component(&e.name) {
                 continue;
             }
-            if e.is_symlink || is_skippable(&e.name) {
+            if is_skippable(&e.name) {
                 continue;
             }
             let childrel = if rel.is_empty() { e.name.clone() } else { format!("{rel}/{}", e.name) };
+            if e.is_symlink {
+                shadow.insert(childrel);
+                continue;
+            }
             if e.is_dir {
-                if childrel.matches('/').count() < MAX_DEPTH {
-                    stack.push(childrel);
+                // Bound recursion against a hostile/buggy backend that synthesizes an
+                // infinite directory tree (every READDIR returns a subdir). Fail closed,
+                // not silent-skip: a silently omitted subtree reads as a deletion and
+                // reconcile removes the intact local copy.
+                if childrel.matches('/').count() >= MAX_DEPTH {
+                    return Err(SyncError::backend(format!(
+                        "remote tree exceeds max depth {MAX_DEPTH} at {childrel}"
+                    )));
                 }
+                stack.push(childrel);
             } else {
                 out.insert(childrel, Meta { mtime: e.mtime, size: e.size });
             }
         }
     }
-    Ok(out)
+    Ok((out, shadow))
 }
 
 /// A remote path component safe to join under the sync root: non-empty, not `.`/`..`,
