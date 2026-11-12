@@ -2,7 +2,7 @@
 //! three-way reconcile.
 //!
 //! The engine talks to the remote through the small [`RemoteFs`] trait, so it
-//! has no SFTP (or network) dependency of its own — back it with SFTP, S3,
+//! has no SFTP (or network) dependency of its own — back it with SFTP,
 //! another local dir, a fake. A ready-made [`SftpFs`] ships behind the
 //! off-by-default `sftp` feature.
 //!
@@ -16,10 +16,10 @@
 //! use std::path::Path;
 //! let local = Path::new("/home/me/proj");
 //! let state = sftp_sync::state_file("host", "/remote/proj", local);
-//! let mut base = sftp_sync::load_baseline(&state);
+//! let mut base = sftp_sync::load_baseline(&state).unwrap();
 //! let opts = sftp_sync::SyncOptions::default();
 //! let out = sftp_sync::sync_once(fs, "/remote/proj", local, &base, &opts, "host").await.unwrap();
-//! if out.baseline != base { base = out.baseline; sftp_sync::save_baseline(&state, &base); }
+//! if out.baseline != base { base = out.baseline; sftp_sync::save_baseline(&state, &base).unwrap(); }
 //! # }
 //! ```
 
@@ -105,8 +105,8 @@ pub trait RemoteFs {
         &self,
         path: &str,
     ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin>, SyncError>> + Send;
-    /// Create/truncate a file for writing.
-    fn create(
+    /// Atomically create a new file, failing if the path already exists.
+    fn create_new(
         &self,
         path: &str,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError>> + Send;
@@ -117,6 +117,7 @@ pub trait RemoteFs {
         mtime: i64,
     ) -> impl Future<Output = Result<(), SyncError>> + Send;
     fn remove_file(&self, path: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
+    /// Rename a file without replacing an existing destination.
     fn rename(&self, from: &str, to: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
     /// Create a directory; must succeed (or no-op) if it already exists.
     fn mkdir(&self, path: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
@@ -349,13 +350,15 @@ pub async fn sync_once<R: RemoteFs>(
     let (remote, remote_sym) = scan_remote_shadowed(fs, base_remote).await?;
     let allow = opts.allow_delete && !baseline.is_empty(); // first run never deletes
     let mut acts = filter_direction(reconcile(&local, &remote, baseline, allow), opts.direction);
-    // Never delete or overwrite a path occupied by a symlink on either side.
+    // A symlink also shadows all paths beneath it.
     acts.retain(|a| match a {
-        Action::Push(rel) => !remote_sym.contains(rel),
-        Action::Pull(rel) => !local_sym.contains(rel),
-        Action::DelLocal(rel) => !remote_sym.contains(rel),
-        Action::DelRemote(rel) => !local_sym.contains(rel),
-        _ => true,
+        Action::Push(rel)
+        | Action::Pull(rel)
+        | Action::DelLocal(rel)
+        | Action::DelRemote(rel)
+        | Action::Conflict { rel, .. } => {
+            !is_shadowed(rel, &local_sym) && !is_shadowed(rel, &remote_sym)
+        }
     });
     let report = Report::tally(&acts);
 
@@ -369,6 +372,11 @@ pub async fn sync_once<R: RemoteFs>(
     }
     // Advance only successful actions to avoid treating failed transfers as deletions.
     let mut new_base = baseline.clone();
+    for (path, meta) in &local {
+        if remote.get(path) == Some(meta) {
+            new_base.insert(path.clone(), *meta);
+        }
+    }
     let mut changed = 0usize;
     let mut errors = Vec::new();
     for a in &acts {
@@ -386,6 +394,13 @@ pub async fn sync_once<R: RemoteFs>(
         report,
         errors,
     })
+}
+
+fn is_shadowed(path: &str, symlinks: &BTreeSet<String>) -> bool {
+    symlinks.contains(path)
+        || path
+            .match_indices('/')
+            .any(|(i, _)| symlinks.contains(&path[..i]))
 }
 
 /// Fold one successfully-applied action into the running baseline, deriving the
@@ -463,10 +478,13 @@ async fn push<R: RemoteFs>(
     ensure_remote_dirs(fs, base, rel).await?;
     let mtime = local_mtime_secs(&lpath);
     // Stage uploads so interrupted transfers never truncate the destination.
-    let tmp = format!("{rpath}.sync-tmp");
-    let backup = format!("{rpath}.sync-backup.sync-tmp");
+    static NEXT_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT_UPLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tag = format!("{}-{}-{seq}", std::process::id(), now_secs());
+    let tmp = format!("{rpath}.{tag}.sync-tmp");
+    let backup = format!("{rpath}.{tag}.sync-backup.sync-tmp");
     let mut lf = tokio::fs::File::open(&lpath).await?;
-    let mut w = fs.create(&tmp).await?;
+    let mut w = fs.create_new(&tmp).await?;
     let transfer = async {
         tokio::io::copy(&mut lf, &mut w).await?;
         w.shutdown().await?; // flush + close (adapter awaits SFTP CLOSE)
@@ -653,6 +671,12 @@ async fn scan_remote_shadowed<R: RemoteFs>(
             if !is_safe_component(&e.name) {
                 continue;
             }
+            if e.name.ends_with(".sync-backup.sync-tmp") {
+                return Err(SyncError::backend(format!(
+                    "unfinished upload backup at {}; manual recovery required",
+                    join(&dir, &e.name)
+                )));
+            }
             if is_skippable(&e.name) {
                 continue;
             }
@@ -723,20 +747,35 @@ pub fn state_file(host: &str, base_remote: &str, local_root: &Path) -> std::path
     dir.join(format!("{hex}.json"))
 }
 
-pub fn load_baseline(path: &Path) -> Tree {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+pub fn load_baseline(path: &Path) -> Result<Tree, SyncError> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(SyncError::backend),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Tree::new()),
+        Err(e) => Err(e.into()),
+    }
 }
 
-pub fn save_baseline(path: &Path, tree: &Tree) {
-    if let Ok(s) = serde_json::to_string(tree) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, s).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+pub fn save_baseline(path: &Path, tree: &Tree) -> Result<(), SyncError> {
+    use std::io::Write;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
     }
+    let data = serde_json::to_vec(tree).map_err(SyncError::backend)?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}-{n}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let _cleanup = RemoveFileOnDrop(tmp.clone());
+    file.write_all(&data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 // ---- small self-contained helpers -------------------------------------------

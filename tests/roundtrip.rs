@@ -43,9 +43,15 @@ impl RemoteFs for LocalFs {
                 .map_err(SyncError::backend)?,
         ))
     }
-    async fn create(&self, path: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
         Ok(Box::new(
-            tokio::fs::File::create(path)
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
                 .await
                 .map_err(SyncError::backend)?,
         ))
@@ -58,7 +64,8 @@ impl RemoteFs for LocalFs {
         std::fs::remove_file(path).map_err(SyncError::backend)
     }
     async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
-        std::fs::rename(from, to).map_err(SyncError::backend)
+        std::fs::hard_link(from, to).map_err(SyncError::backend)?;
+        std::fs::remove_file(from).map_err(SyncError::backend)
     }
     async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
         let _ = std::fs::create_dir(path);
@@ -76,7 +83,10 @@ impl RemoteFs for FailingPush {
     async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
         LocalFs.open_read(path).await
     }
-    async fn create(&self, _path: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+    async fn create_new(
+        &self,
+        _path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
         Err(SyncError::backend(std::io::Error::other("push disabled")))
     }
     async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
@@ -104,8 +114,11 @@ impl RemoteFs for FailPublish {
     async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
         LocalFs.open_read(path).await
     }
-    async fn create(&self, path: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
-        LocalFs.create(path).await
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        LocalFs.create_new(path).await
     }
     async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
         LocalFs.set_mtime(path, mtime).await
@@ -150,7 +163,7 @@ impl RemoteFs for HostileFs {
     async fn open_read(&self, _p: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
         Ok(Box::new(&b"x"[..]))
     }
-    async fn create(&self, _p: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+    async fn create_new(&self, _p: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
         Ok(Box::new(Vec::new()))
     }
     async fn set_mtime(&self, _p: &str, _m: i64) -> Result<(), SyncError> {
@@ -244,6 +257,84 @@ async fn first_run_unions_both_sides() {
         "remote pulled"
     );
     assert_eq!(out.baseline.len(), 2);
+}
+
+#[tokio::test]
+async fn matching_files_enter_baseline_and_deletions_propagate() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "same.txt", "same", 1000);
+    put(&remote, "same.txt", "same", 1000);
+    let out = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    assert_eq!(out.changed, 0);
+    assert!(out.baseline.contains_key("same.txt"));
+    std::fs::remove_file(local.join("same.txt")).unwrap();
+    sync(&remote, &local, &out.baseline, true).await;
+    assert!(!remote.join("same.txt").exists());
+}
+
+#[tokio::test]
+async fn exclusive_remote_create_refuses_existing_symlinks() {
+    let remote = tmpdir("r");
+    let canary = remote.join("canary");
+    std::fs::write(&canary, "safe").unwrap();
+    let staging = remote.join("staging.sync-tmp");
+    std::os::unix::fs::symlink(&canary, &staging).unwrap();
+    assert!(LocalFs.create_new(staging.to_str().unwrap()).await.is_err());
+    assert_eq!(std::fs::read_to_string(canary).unwrap(), "safe");
+}
+
+#[tokio::test]
+async fn unfinished_remote_backup_stops_reconciliation() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "file", "keep", 1000);
+    put(&remote, "file.123.sync-backup.sync-tmp", "old", 1000);
+    let mut baseline = sftp_sync::Tree::new();
+    baseline.insert(
+        "file".into(),
+        sftp_sync::Meta {
+            mtime: 1000,
+            size: 4,
+        },
+    );
+    let opts = sftp_sync::SyncOptions {
+        allow_delete: true,
+        ..Default::default()
+    };
+    let result = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &baseline,
+        &opts,
+        "h",
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(read(&local, "file").as_deref(), Some("keep"));
+}
+
+#[test]
+fn baseline_errors_are_reported() {
+    let root = tmpdir("state");
+    let path = root.join("baseline.json");
+    assert!(sftp_sync::load_baseline(&path).unwrap().is_empty());
+    std::fs::write(&path, "not json").unwrap();
+    assert!(sftp_sync::load_baseline(&path).is_err());
+    assert!(sftp_sync::save_baseline(&root, &sftp_sync::Tree::new()).is_err());
+    sftp_sync::save_baseline(&path, &sftp_sync::Tree::new()).unwrap();
+    assert!(sftp_sync::load_baseline(&path).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn symlinked_directory_shadows_descendants() {
+    let (local, remote, outside) = (tmpdir("l"), tmpdir("r"), tmpdir("outside"));
+    put(&remote, "dir/file", "remote", 1000);
+    put(&outside, "file", "outside", 1000);
+    std::os::unix::fs::symlink(&outside, local.join("dir")).unwrap();
+    let out = sync(&remote, &local, &sftp_sync::Tree::new(), false).await;
+    assert_eq!(out.changed, 0);
+    assert_eq!(read(&outside, "file").as_deref(), Some("outside"));
+    assert_eq!(read(&remote, "dir/file").as_deref(), Some("remote"));
 }
 
 #[tokio::test]

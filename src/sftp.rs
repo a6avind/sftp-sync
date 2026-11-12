@@ -147,8 +147,18 @@ impl RemoteFs for SftpFs {
         Ok(Box::new(f))
     }
 
-    async fn create(&self, path: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
-        let f = self.sftp.create(path).await.map_err(be)?;
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        let f = self
+            .sftp
+            .open_with_flags(
+                path,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+            )
+            .await
+            .map_err(be)?;
         Ok(Box::new(f))
     }
 
