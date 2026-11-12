@@ -97,12 +97,25 @@ pub struct RemoteEntry {
 /// `io::Error` converts automatically via `?`. All futures are `Send` so the
 /// engine can run under a multi-thread runtime.
 pub trait RemoteFs {
-    fn read_dir(&self, path: &str) -> impl Future<Output = Result<Vec<RemoteEntry>, SyncError>> + Send;
-    fn open_read(&self, path: &str) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin>, SyncError>> + Send;
+    fn read_dir(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = Result<Vec<RemoteEntry>, SyncError>> + Send;
+    fn open_read(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin>, SyncError>> + Send;
     /// Create/truncate a file for writing.
-    fn create(&self, path: &str) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError>> + Send;
+    fn create(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError>> + Send;
     /// Set a file's mtime (whole seconds). Best-effort; keeps synced pairs equal.
-    fn set_mtime(&self, path: &str, mtime: i64) -> impl Future<Output = Result<(), SyncError>> + Send;
+    fn set_mtime(
+        &self,
+        path: &str,
+        mtime: i64,
+    ) -> impl Future<Output = Result<(), SyncError>> + Send;
     fn remove_file(&self, path: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
     fn rename(&self, from: &str, to: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
     /// Create a directory; must succeed (or no-op) if it already exists.
@@ -136,7 +149,10 @@ pub enum Action {
     DelLocal(String),
     /// Both sides changed since baseline; `local_newer` decides which keeps the
     /// real name (the other becomes a `.conflict-…` copy).
-    Conflict { rel: String, local_newer: bool },
+    Conflict {
+        rel: String,
+        local_newer: bool,
+    },
 }
 
 /// Which way changes flow.
@@ -165,7 +181,12 @@ pub struct SyncOptions {
 
 impl Default for SyncOptions {
     fn default() -> Self {
-        SyncOptions { git: false, allow_delete: true, direction: Direction::Both, dry_run: false }
+        SyncOptions {
+            git: false,
+            allow_delete: true,
+            direction: Direction::Both,
+            dry_run: false,
+        }
     }
 }
 
@@ -238,8 +259,11 @@ fn filter_direction(acts: Vec<Action>, dir: Direction) -> Vec<Action> {
 /// use that on the first run so an empty baseline can't wipe a populated side.
 pub fn reconcile(local: &Tree, remote: &Tree, base: &Tree, allow_delete: bool) -> Vec<Action> {
     let mut acts = Vec::new();
-    let keys: std::collections::BTreeSet<&String> =
-        local.keys().chain(remote.keys()).chain(base.keys()).collect();
+    let keys: std::collections::BTreeSet<&String> = local
+        .keys()
+        .chain(remote.keys())
+        .chain(base.keys())
+        .collect();
     for k in keys {
         let l = local.get(k);
         let r = remote.get(k);
@@ -252,22 +276,37 @@ pub fn reconcile(local: &Tree, remote: &Tree, base: &Tree, allow_delete: bool) -
                 let lchanged = b != Some(l);
                 let rchanged = b != Some(r);
                 match (lchanged, rchanged) {
-                    (true, true) => acts.push(Action::Conflict { rel: k.clone(), local_newer: l.mtime >= r.mtime }),
+                    (true, true) => acts.push(Action::Conflict {
+                        rel: k.clone(),
+                        local_newer: l.mtime >= r.mtime,
+                    }),
                     (true, false) => acts.push(Action::Push(k.clone())),
                     (false, true) => acts.push(Action::Pull(k.clone())),
-                    (false, false) => acts.push(if l.mtime >= r.mtime { Action::Push(k.clone()) } else { Action::Pull(k.clone()) }),
+                    (false, false) => acts.push(if l.mtime >= r.mtime {
+                        Action::Push(k.clone())
+                    } else {
+                        Action::Pull(k.clone())
+                    }),
                 }
             }
             (Some(l), None) => {
                 if b.is_some() && allow_delete {
-                    if b == Some(l) { acts.push(Action::DelLocal(k.clone())) } else { acts.push(Action::Push(k.clone())) }
+                    if b == Some(l) {
+                        acts.push(Action::DelLocal(k.clone()))
+                    } else {
+                        acts.push(Action::Push(k.clone()))
+                    }
                 } else {
                     acts.push(Action::Push(k.clone()));
                 }
             }
             (None, Some(r)) => {
                 if b.is_some() && allow_delete {
-                    if b == Some(r) { acts.push(Action::DelRemote(k.clone())) } else { acts.push(Action::Pull(k.clone())) }
+                    if b == Some(r) {
+                        acts.push(Action::DelRemote(k.clone()))
+                    } else {
+                        acts.push(Action::Pull(k.clone()))
+                    }
                 } else {
                     acts.push(Action::Pull(k.clone()));
                 }
@@ -321,7 +360,12 @@ pub async fn sync_once<R: RemoteFs>(
     let report = Report::tally(&acts);
 
     if opts.dry_run {
-        return Ok(Outcome { baseline: baseline.clone(), changed: 0, report, errors: Vec::new() });
+        return Ok(Outcome {
+            baseline: baseline.clone(),
+            changed: 0,
+            report,
+            errors: Vec::new(),
+        });
     }
     // Advance only successful actions to avoid treating failed transfers as deletions.
     let mut new_base = baseline.clone();
@@ -336,7 +380,12 @@ pub async fn sync_once<R: RemoteFs>(
             Err(e) => errors.push(format!("{a:?}: {e}")),
         }
     }
-    Ok(Outcome { baseline: new_base, changed, report, errors })
+    Ok(Outcome {
+        baseline: new_base,
+        changed,
+        report,
+        errors,
+    })
 }
 
 /// Fold one successfully-applied action into the running baseline, deriving the
@@ -344,28 +393,47 @@ pub async fn sync_once<R: RemoteFs>(
 fn commit_baseline(base: &mut Tree, a: &Action, local: &Tree, remote: &Tree) {
     match a {
         Action::Push(rel) => {
-            if let Some(m) = local.get(rel) { base.insert(rel.clone(), *m); }
+            if let Some(m) = local.get(rel) {
+                base.insert(rel.clone(), *m);
+            }
         }
         Action::Pull(rel) => {
-            if let Some(m) = remote.get(rel) { base.insert(rel.clone(), *m); }
+            if let Some(m) = remote.get(rel) {
+                base.insert(rel.clone(), *m);
+            }
         }
         Action::DelRemote(rel) | Action::DelLocal(rel) => {
             base.remove(rel);
         }
         Action::Conflict { rel, local_newer } => {
-            let side = if *local_newer { local.get(rel) } else { remote.get(rel) };
-            if let Some(m) = side { base.insert(rel.clone(), *m); }
+            let side = if *local_newer {
+                local.get(rel)
+            } else {
+                remote.get(rel)
+            };
+            if let Some(m) = side {
+                base.insert(rel.clone(), *m);
+            }
         }
     }
 }
 
-async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, host: &str, remote: &Tree) -> Result<(), SyncError> {
+async fn apply<R: RemoteFs>(
+    fs: &R,
+    base: &str,
+    local_root: &Path,
+    a: &Action,
+    host: &str,
+    remote: &Tree,
+) -> Result<(), SyncError> {
     let rmtime = |rel: &str| remote.get(rel).map(|m| m.mtime).unwrap_or(0);
     match a {
         Action::Push(rel) => push(fs, base, local_root, rel, remote.contains_key(rel)).await,
         Action::Pull(rel) => pull(fs, base, local_root, rel, rel, rmtime(rel)).await,
         Action::DelRemote(rel) => fs.remove_file(&join(base, rel)).await,
-        Action::DelLocal(rel) => std::fs::remove_file(local_root.join(rel)).map_err(SyncError::from),
+        Action::DelLocal(rel) => {
+            std::fs::remove_file(local_root.join(rel)).map_err(SyncError::from)
+        }
         Action::Conflict { rel, local_newer } => {
             // Counter suffix: two conflicts on the same path within one wall-clock
             // second would otherwise share a tag and clobber the first aside-copy.
@@ -383,7 +451,13 @@ async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, h
     }
 }
 
-async fn push<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, rel: &str, destination_exists: bool) -> Result<(), SyncError> {
+async fn push<R: RemoteFs>(
+    fs: &R,
+    base: &str,
+    local_root: &Path,
+    rel: &str,
+    destination_exists: bool,
+) -> Result<(), SyncError> {
     let lpath = local_root.join(rel);
     let rpath = join(base, rel);
     ensure_remote_dirs(fs, base, rel).await?;
@@ -422,7 +496,14 @@ async fn push<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, rel: &str, des
     transfer
 }
 
-async fn pull<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, src_rel: &str, dst_rel: &str, mtime: i64) -> Result<(), SyncError> {
+async fn pull<R: RemoteFs>(
+    fs: &R,
+    base: &str,
+    local_root: &Path,
+    src_rel: &str,
+    dst_rel: &str,
+    mtime: i64,
+) -> Result<(), SyncError> {
     let rpath = join(base, src_rel);
     let lpath = local_root.join(dst_rel);
     if let Some(parent) = lpath.parent() {
@@ -450,9 +531,8 @@ async fn pull<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, src_rel: &str,
             Err(error) => return Err(error.into()),
         }
     }
-    let (tmp, mut lf) = created.ok_or_else(|| {
-        SyncError::backend("could not allocate a unique local staging file")
-    })?;
+    let (tmp, mut lf) = created
+        .ok_or_else(|| SyncError::backend("could not allocate a unique local staging file"))?;
     let _cleanup = RemoveFileOnDrop(tmp.clone());
     let mut r = fs.open_read(&rpath).await?;
     tokio::io::copy(&mut r, &mut lf).await?;
@@ -464,7 +544,9 @@ async fn pull<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, src_rel: &str,
 }
 
 fn copy_local(local_root: &Path, rel: &str, dst_rel: &str) -> Result<(), SyncError> {
-    std::fs::copy(local_root.join(rel), local_root.join(dst_rel)).map(|_| ()).map_err(SyncError::from)
+    std::fs::copy(local_root.join(rel), local_root.join(dst_rel))
+        .map(|_| ())
+        .map_err(SyncError::from)
 }
 
 async fn ensure_remote_dirs<R: RemoteFs>(fs: &R, base: &str, rel: &str) -> Result<(), SyncError> {
@@ -506,8 +588,12 @@ fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>
     // tree, which reconcile reads as a remote-side delete → local data loss. Abort.
     for entry in walker {
         let entry = entry.map_err(SyncError::backend)?;
-        let Some(ft) = entry.file_type() else { continue };
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
         let Some(rel) = rel.to_str() else { continue };
         if is_skippable(rel) {
             continue;
@@ -527,7 +613,13 @@ fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        out.insert(rel, Meta { mtime, size: m.len() });
+        out.insert(
+            rel,
+            Meta {
+                mtime,
+                size: m.len(),
+            },
+        );
     }
     Ok((out, shadow))
 }
@@ -541,13 +633,20 @@ pub async fn scan_remote<R: RemoteFs>(fs: &R, base: &str) -> Result<Tree, SyncEr
 /// Like [`scan_remote`] but also returns the set of paths occupied by a symlink.
 /// A symlinked path must not read as absent, or reconcile deletes the intact file
 /// on the other side. See [`sync_once`].
-async fn scan_remote_shadowed<R: RemoteFs>(fs: &R, base: &str) -> Result<(Tree, BTreeSet<String>), SyncError> {
+async fn scan_remote_shadowed<R: RemoteFs>(
+    fs: &R,
+    base: &str,
+) -> Result<(Tree, BTreeSet<String>), SyncError> {
     const MAX_DEPTH: usize = 64;
     let mut out = Tree::new();
     let mut shadow = BTreeSet::new();
     let mut stack = vec![String::new()];
     while let Some(rel) = stack.pop() {
-        let dir = if rel.is_empty() { base.to_string() } else { join(base, &rel) };
+        let dir = if rel.is_empty() {
+            base.to_string()
+        } else {
+            join(base, &rel)
+        };
         for e in fs.read_dir(&dir).await? {
             // Untrusted backend name: `.`/`..`/`a/../../etc` joined unchecked escapes
             // `base` on pull and drives `..` recursion. One choke point for every entry.
@@ -557,7 +656,11 @@ async fn scan_remote_shadowed<R: RemoteFs>(fs: &R, base: &str) -> Result<(Tree, 
             if is_skippable(&e.name) {
                 continue;
             }
-            let childrel = if rel.is_empty() { e.name.clone() } else { format!("{rel}/{}", e.name) };
+            let childrel = if rel.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{rel}/{}", e.name)
+            };
             if e.is_symlink {
                 shadow.insert(childrel);
                 continue;
@@ -574,7 +677,13 @@ async fn scan_remote_shadowed<R: RemoteFs>(fs: &R, base: &str) -> Result<(Tree, 
                 }
                 stack.push(childrel);
             } else {
-                out.insert(childrel, Meta { mtime: e.mtime, size: e.size });
+                out.insert(
+                    childrel,
+                    Meta {
+                        mtime: e.mtime,
+                        size: e.size,
+                    },
+                );
             }
         }
     }
@@ -615,7 +724,10 @@ pub fn state_file(host: &str, base_remote: &str, local_root: &Path) -> std::path
 }
 
 pub fn load_baseline(path: &Path) -> Tree {
-    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 pub fn save_baseline(path: &Path, tree: &Tree) {
@@ -630,7 +742,10 @@ pub fn save_baseline(path: &Path, tree: &Tree) {
 // ---- small self-contained helpers -------------------------------------------
 
 fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn local_mtime_secs(p: &Path) -> i64 {
@@ -645,8 +760,13 @@ fn local_mtime_secs(p: &Path) -> i64 {
 #[cfg(unix)]
 fn set_local_mtime(p: &Path, secs: i64) {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else { return };
-    let t = libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: 0 };
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return;
+    };
+    let t = libc::timespec {
+        tv_sec: secs as libc::time_t,
+        tv_nsec: 0,
+    };
     let times = [t, t];
     unsafe {
         libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
@@ -698,7 +818,11 @@ mod tests {
         let acts = reconcile(&local, &remote, &Tree::new(), false);
         assert!(acts.contains(&Action::Push("a".into())));
         assert!(acts.contains(&Action::Pull("b".into())));
-        assert!(!acts.iter().any(|a| matches!(a, Action::DelLocal(_) | Action::DelRemote(_))));
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::DelLocal(_) | Action::DelRemote(_)))
+        );
     }
 
     #[test]
@@ -733,6 +857,12 @@ mod tests {
         let local = t(&[("a", m(20, 11))]);
         let remote = t(&[("a", m(9, 13))]);
         let acts = reconcile(&local, &remote, &base, true);
-        assert_eq!(acts, vec![Action::Conflict { rel: "a".into(), local_newer: true }]);
+        assert_eq!(
+            acts,
+            vec![Action::Conflict {
+                rel: "a".into(),
+                local_newer: true
+            }]
+        );
     }
 }

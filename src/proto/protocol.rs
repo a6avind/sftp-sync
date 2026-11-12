@@ -154,7 +154,9 @@ impl FileAttributes {
     }
 
     pub fn file_type(&self) -> FileType {
-        self.permissions.map(FileType::from_mode).unwrap_or(FileType::Other)
+        self.permissions
+            .map(FileType::from_mode)
+            .unwrap_or(FileType::Other)
     }
     pub fn is_dir(&self) -> bool {
         self.file_type().is_dir()
@@ -173,7 +175,8 @@ impl FileAttributes {
         self.len() == 0
     }
     pub fn modified(&self) -> Option<SystemTime> {
-        self.mtime.map(|s| UNIX_EPOCH + Duration::from_secs(s as u64))
+        self.mtime
+            .map(|s| UNIX_EPOCH + Duration::from_secs(s as u64))
     }
 
     pub(crate) fn encode(&self, out: &mut PacketBuf) {
@@ -286,11 +289,19 @@ pub struct File {
 
 impl File {
     pub fn new(filename: String, attrs: FileAttributes) -> Self {
-        File { filename, longname: String::new(), attrs }
+        File {
+            filename,
+            longname: String::new(),
+            attrs,
+        }
     }
     /// A name-only entry (no attributes), for realpath/readlink replies.
     pub fn dummy(filename: String) -> Self {
-        File { filename, longname: String::new(), attrs: FileAttributes::empty() }
+        File {
+            filename,
+            longname: String::new(),
+            attrs: FileAttributes::empty(),
+        }
     }
     pub fn file_name(&self) -> String {
         self.filename.clone()

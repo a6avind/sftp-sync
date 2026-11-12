@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use russh::client;
 use russh::keys::ssh_key::HashAlg;
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
+use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::proto::client::SftpSession;
@@ -21,7 +21,10 @@ fn be(e: impl std::fmt::Display) -> SyncError {
 pub enum Auth {
     Password(String),
     /// OpenSSH/PEM private-key file, with optional passphrase.
-    KeyFile { path: std::path::PathBuf, passphrase: Option<String> },
+    KeyFile {
+        path: std::path::PathBuf,
+        passphrase: Option<String>,
+    },
 }
 
 pub enum HostKey {
@@ -62,7 +65,10 @@ impl SftpFs {
     /// handling. `keepalive` owns the transport (e.g. the russh `Handle`) and is
     /// held for the [`SftpFs`]'s lifetime to keep the connection open.
     pub fn from_session(sftp: SftpSession, keepalive: impl Send + Sync + 'static) -> Self {
-        SftpFs { sftp, keepalive: Box::new(keepalive) }
+        SftpFs {
+            sftp,
+            keepalive: Box::new(keepalive),
+        }
     }
 
     /// Connect, authenticate, and open the SFTP subsystem. For host-key handling
@@ -81,7 +87,11 @@ impl SftpFs {
             .map_err(be)?;
 
         let ok = match auth {
-            Auth::Password(pw) => handle.authenticate_password(user, pw).await.map_err(be)?.success(),
+            Auth::Password(pw) => handle
+                .authenticate_password(user, pw)
+                .await
+                .map_err(be)?
+                .success(),
             Auth::KeyFile { path, passphrase } => {
                 let key = load_secret_key(path, passphrase.as_deref()).map_err(be)?;
                 handle
@@ -98,7 +108,10 @@ impl SftpFs {
         let channel = handle.channel_open_session().await.map_err(be)?;
         channel.request_subsystem(true, "sftp").await.map_err(be)?;
         let sftp = SftpSession::new(channel.into_stream()).await.map_err(be)?;
-        Ok(SftpFs { sftp, keepalive: Box::new(handle) })
+        Ok(SftpFs {
+            sftp,
+            keepalive: Box::new(handle),
+        })
     }
 }
 
@@ -126,7 +139,11 @@ impl RemoteFs for SftpFs {
     }
 
     async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
-        let f = self.sftp.open_with_flags(path, OpenFlags::READ).await.map_err(be)?;
+        let f = self
+            .sftp
+            .open_with_flags(path, OpenFlags::READ)
+            .await
+            .map_err(be)?;
         Ok(Box::new(f))
     }
 
@@ -164,7 +181,9 @@ impl RemoteFs for SftpFs {
             Err(E::Status(s)) if s.status_code == StatusCode::Failure => {
                 match self.sftp.metadata(path).await {
                     Ok(attrs) if attrs.is_dir() => Ok(()),
-                    Ok(_) => Err(SyncError::backend(format!("{path} exists and is not a directory"))),
+                    Ok(_) => Err(SyncError::backend(format!(
+                        "{path} exists and is not a directory"
+                    ))),
                     Err(e) => Err(SyncError::backend(format!("mkdir {path}: {e}"))),
                 }
             }

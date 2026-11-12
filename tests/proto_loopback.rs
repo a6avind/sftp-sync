@@ -20,8 +20,15 @@ struct MemFs {
 }
 
 enum Kind {
-    File { path: String, buf: Vec<u8>, writable: bool },
-    Dir { entries: Vec<(String, FileAttributes)>, sent: bool },
+    File {
+        path: String,
+        buf: Vec<u8>,
+        writable: bool,
+    },
+    Dir {
+        entries: Vec<(String, FileAttributes)>,
+        sent: bool,
+    },
 }
 
 struct Mem {
@@ -32,7 +39,12 @@ struct Mem {
 
 impl Mem {
     fn ok(id: u32) -> Status {
-        Status { id, status_code: StatusCode::Ok, error_message: "ok".into(), language_tag: "en".into() }
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "ok".into(),
+            language_tag: "en".into(),
+        }
     }
     fn alloc(&mut self) -> String {
         let h = self.counter.to_string();
@@ -40,10 +52,17 @@ impl Mem {
         h
     }
     fn dir_attrs() -> FileAttributes {
-        FileAttributes { permissions: Some(0o040755), ..Default::default() }
+        FileAttributes {
+            permissions: Some(0o040755),
+            ..Default::default()
+        }
     }
     fn file_attrs(len: u64) -> FileAttributes {
-        FileAttributes { size: Some(len), permissions: Some(0o100644), ..Default::default() }
+        FileAttributes {
+            size: Some(len),
+            permissions: Some(0o100644),
+            ..Default::default()
+        }
     }
 }
 
@@ -55,14 +74,26 @@ impl server::Handler for Mem {
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
         let p = if path == "." { "/".to_string() } else { path };
-        Ok(Name { id, files: vec![File::dummy(p)] })
+        Ok(Name {
+            id,
+            files: vec![File::dummy(p)],
+        })
     }
-    async fn mkdir(&mut self, id: u32, path: String, _a: FileAttributes) -> Result<Status, StatusCode> {
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _a: FileAttributes,
+    ) -> Result<Status, StatusCode> {
         self.fs.dirs.insert(path);
         Ok(Self::ok(id))
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
-        let prefix = if path.ends_with('/') { path.clone() } else { format!("{path}/") };
+        let prefix = if path.ends_with('/') {
+            path.clone()
+        } else {
+            format!("{path}/")
+        };
         let mut entries = Vec::new();
         for (name, buf) in &self.fs.files {
             if let Some(rest) = name.strip_prefix(&prefix)
@@ -80,13 +111,22 @@ impl server::Handler for Mem {
             }
         }
         let h = self.alloc();
-        self.handles.insert(h.clone(), Kind::Dir { entries, sent: false });
+        self.handles.insert(
+            h.clone(),
+            Kind::Dir {
+                entries,
+                sent: false,
+            },
+        );
         Ok(Handle { id, handle: h })
     }
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, StatusCode> {
         match self.handles.get_mut(&handle) {
             Some(Kind::Dir { entries, sent }) if !*sent => {
-                let files = entries.iter().map(|(n, a)| File::new(n.clone(), *a)).collect();
+                let files = entries
+                    .iter()
+                    .map(|(n, a)| File::new(n.clone(), *a))
+                    .collect();
                 *sent = true;
                 Ok(Name { id, files })
             }
@@ -105,13 +145,30 @@ impl server::Handler for Mem {
         let buf = if writable {
             Vec::new()
         } else {
-            self.fs.files.get(&filename).cloned().ok_or(StatusCode::NoSuchFile)?
+            self.fs
+                .files
+                .get(&filename)
+                .cloned()
+                .ok_or(StatusCode::NoSuchFile)?
         };
         let h = self.alloc();
-        self.handles.insert(h.clone(), Kind::File { path: filename, buf, writable });
+        self.handles.insert(
+            h.clone(),
+            Kind::File {
+                path: filename,
+                buf,
+                writable,
+            },
+        );
         Ok(Handle { id, handle: h })
     }
-    async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, StatusCode> {
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, StatusCode> {
         match self.handles.get(&handle) {
             Some(Kind::File { buf, .. }) => {
                 let start = offset as usize;
@@ -119,14 +176,27 @@ impl server::Handler for Mem {
                     return Err(StatusCode::Eof);
                 }
                 let end = (start + len as usize).min(buf.len());
-                Ok(Data { id, data: buf[start..end].to_vec() })
+                Ok(Data {
+                    id,
+                    data: buf[start..end].to_vec(),
+                })
             }
             _ => Err(StatusCode::Failure),
         }
     }
-    async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, StatusCode> {
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, StatusCode> {
         match self.handles.get_mut(&handle) {
-            Some(Kind::File { buf, writable: true, .. }) => {
+            Some(Kind::File {
+                buf,
+                writable: true,
+                ..
+            }) => {
                 let start = offset as usize;
                 let end = start + data.len();
                 if end > buf.len() {
@@ -139,18 +209,35 @@ impl server::Handler for Mem {
         }
     }
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, StatusCode> {
-        if let Some(Kind::File { path, buf, writable: true }) = self.handles.remove(&handle) {
+        if let Some(Kind::File {
+            path,
+            buf,
+            writable: true,
+        }) = self.handles.remove(&handle)
+        {
             self.fs.files.insert(path, buf);
         }
         Ok(Self::ok(id))
     }
-    async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, StatusCode> {
-        let v = self.fs.files.remove(&oldpath).ok_or(StatusCode::NoSuchFile)?;
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, StatusCode> {
+        let v = self
+            .fs
+            .files
+            .remove(&oldpath)
+            .ok_or(StatusCode::NoSuchFile)?;
         self.fs.files.insert(newpath, v);
         Ok(Self::ok(id))
     }
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, StatusCode> {
-        self.fs.files.remove(&filename).ok_or(StatusCode::NoSuchFile)?;
+        self.fs
+            .files
+            .remove(&filename)
+            .ok_or(StatusCode::NoSuchFile)?;
         Ok(Self::ok(id))
     }
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
@@ -162,7 +249,10 @@ impl server::Handler for Mem {
             }
             Ok(Attrs { id, attrs })
         } else if self.fs.dirs.contains(&path) {
-            Ok(Attrs { id, attrs: Mem::dir_attrs() })
+            Ok(Attrs {
+                id,
+                attrs: Mem::dir_attrs(),
+            })
         } else {
             Err(StatusCode::NoSuchFile)
         }
@@ -170,7 +260,12 @@ impl server::Handler for Mem {
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
         self.stat(id, path).await
     }
-    async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, StatusCode> {
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, StatusCode> {
         if let (Some(a), Some(m)) = (attrs.atime, attrs.mtime) {
             self.fs.times.insert(path, (a, m));
         }
@@ -180,7 +275,11 @@ impl server::Handler for Mem {
 
 async fn session() -> SftpSession {
     let (client, srv) = tokio::io::duplex(64 * 1024);
-    let mem = Mem { fs: MemFs::default(), handles: HashMap::new(), counter: 0 };
+    let mem = Mem {
+        fs: MemFs::default(),
+        handles: HashMap::new(),
+        counter: 0,
+    };
     server::run(srv, mem).await;
     SftpSession::new(client).await.expect("client handshake")
 }
@@ -210,18 +309,37 @@ async fn client_server_roundtrip() {
     r2.read_to_string(&mut tail).await.expect("read tail");
     assert_eq!(tail, "sftp");
 
-    let names: Vec<String> = s.read_dir("/data").await.expect("readdir").map(|e| e.file_name()).collect();
+    let names: Vec<String> = s
+        .read_dir("/data")
+        .await
+        .expect("readdir")
+        .map(|e| e.file_name())
+        .collect();
     assert_eq!(names, vec!["hello.txt".to_string()]);
 
     // setstat with mtime only: the encoder must fill atime from mtime so the
     // server sees both — a one-sided send would leave atime zeroed.
-    let attrs = FileAttributes { mtime: Some(5000), ..FileAttributes::empty() };
-    s.set_metadata("/data/hello.txt", attrs).await.expect("setstat");
-    let after = s.metadata("/data/hello.txt").await.expect("stat after setstat");
+    let attrs = FileAttributes {
+        mtime: Some(5000),
+        ..FileAttributes::empty()
+    };
+    s.set_metadata("/data/hello.txt", attrs)
+        .await
+        .expect("setstat");
+    let after = s
+        .metadata("/data/hello.txt")
+        .await
+        .expect("stat after setstat");
     assert_eq!(after.mtime, Some(5000), "mtime applied");
-    assert_eq!(after.atime, Some(5000), "atime filled from mtime, not zeroed");
+    assert_eq!(
+        after.atime,
+        Some(5000),
+        "atime filled from mtime, not zeroed"
+    );
 
-    s.rename("/data/hello.txt", "/data/bye.txt").await.expect("rename");
+    s.rename("/data/hello.txt", "/data/bye.txt")
+        .await
+        .expect("rename");
     assert!(s.metadata("/data/hello.txt").await.is_err());
     assert!(s.metadata("/data/bye.txt").await.is_ok());
     s.remove_file("/data/bye.txt").await.expect("remove");

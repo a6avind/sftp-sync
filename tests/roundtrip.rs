@@ -37,10 +37,18 @@ impl RemoteFs for LocalFs {
         Ok(out)
     }
     async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
-        Ok(Box::new(tokio::fs::File::open(path).await.map_err(SyncError::backend)?))
+        Ok(Box::new(
+            tokio::fs::File::open(path)
+                .await
+                .map_err(SyncError::backend)?,
+        ))
     }
     async fn create(&self, path: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
-        Ok(Box::new(tokio::fs::File::create(path).await.map_err(SyncError::backend)?))
+        Ok(Box::new(
+            tokio::fs::File::create(path)
+                .await
+                .map_err(SyncError::backend)?,
+        ))
     }
     async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
         set_mtime(Path::new(path), mtime);
@@ -106,7 +114,10 @@ impl RemoteFs for FailPublish {
         LocalFs.remove_file(path).await
     }
     async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
-        if to.ends_with("/a.txt") && from.ends_with(".sync-tmp") && !from.ends_with(".sync-backup.sync-tmp") {
+        if to.ends_with("/a.txt")
+            && from.ends_with(".sync-tmp")
+            && !from.ends_with(".sync-backup.sync-tmp")
+        {
             return Err(SyncError::backend("simulated publish failure"));
         }
         LocalFs.rename(from, to).await
@@ -121,8 +132,20 @@ struct HostileFs;
 
 impl RemoteFs for HostileFs {
     async fn read_dir(&self, _path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
-        let bad = |n: &str| RemoteEntry { name: n.into(), is_dir: false, is_symlink: false, mtime: 1, size: 1 };
-        Ok(vec![bad("."), bad(".."), bad("../escape"), bad("a/b"), bad("ok.txt")])
+        let bad = |n: &str| RemoteEntry {
+            name: n.into(),
+            is_dir: false,
+            is_symlink: false,
+            mtime: 1,
+            size: 1,
+        };
+        Ok(vec![
+            bad("."),
+            bad(".."),
+            bad("../escape"),
+            bad("a/b"),
+            bad("ok.txt"),
+        ])
     }
     async fn open_read(&self, _p: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
         Ok(Box::new(&b"x"[..]))
@@ -130,10 +153,18 @@ impl RemoteFs for HostileFs {
     async fn create(&self, _p: &str) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
         Ok(Box::new(Vec::new()))
     }
-    async fn set_mtime(&self, _p: &str, _m: i64) -> Result<(), SyncError> { Ok(()) }
-    async fn remove_file(&self, _p: &str) -> Result<(), SyncError> { Ok(()) }
-    async fn rename(&self, _f: &str, _t: &str) -> Result<(), SyncError> { Ok(()) }
-    async fn mkdir(&self, _p: &str) -> Result<(), SyncError> { Ok(()) }
+    async fn set_mtime(&self, _p: &str, _m: i64) -> Result<(), SyncError> {
+        Ok(())
+    }
+    async fn remove_file(&self, _p: &str) -> Result<(), SyncError> {
+        Ok(())
+    }
+    async fn rename(&self, _f: &str, _t: &str) -> Result<(), SyncError> {
+        Ok(())
+    }
+    async fn mkdir(&self, _p: &str) -> Result<(), SyncError> {
+        Ok(())
+    }
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -149,7 +180,10 @@ fn tmpdir(tag: &str) -> PathBuf {
 fn set_mtime(p: &Path, secs: i64) {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-    let t = libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: 0 };
+    let t = libc::timespec {
+        tv_sec: secs as libc::time_t,
+        tv_nsec: 0,
+    };
     let times = [t, t];
     unsafe {
         libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
@@ -169,9 +203,26 @@ fn read(dir: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(rel)).ok()
 }
 
-async fn sync(remote: &Path, local: &Path, base: &sftp_sync::Tree, del: bool) -> sftp_sync::Outcome {
-    let opts = sftp_sync::SyncOptions { allow_delete: del, ..Default::default() };
-    sftp_sync::sync_once(&LocalFs, remote.to_str().unwrap(), local, base, &opts, "testhost").await.unwrap()
+async fn sync(
+    remote: &Path,
+    local: &Path,
+    base: &sftp_sync::Tree,
+    del: bool,
+) -> sftp_sync::Outcome {
+    let opts = sftp_sync::SyncOptions {
+        allow_delete: del,
+        ..Default::default()
+    };
+    sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        local,
+        base,
+        &opts,
+        "testhost",
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -182,8 +233,16 @@ async fn first_run_unions_both_sides() {
 
     let out = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
 
-    assert_eq!(read(&remote, "only_local.txt").as_deref(), Some("L"), "local pushed");
-    assert_eq!(read(&local, "only_remote.txt").as_deref(), Some("R"), "remote pulled");
+    assert_eq!(
+        read(&remote, "only_local.txt").as_deref(),
+        Some("L"),
+        "local pushed"
+    );
+    assert_eq!(
+        read(&local, "only_remote.txt").as_deref(),
+        Some("R"),
+        "remote pulled"
+    );
     assert_eq!(out.baseline.len(), 2);
 }
 
@@ -239,7 +298,11 @@ async fn conflict_keeps_both() {
     put(&remote, "a.txt", "remote-older", 2000);
     sync(&remote, &local, &out.baseline, true).await;
 
-    assert_eq!(read(&remote, "a.txt").as_deref(), Some("local-newer"), "newer wins the name");
+    assert_eq!(
+        read(&remote, "a.txt").as_deref(),
+        Some("local-newer"),
+        "newer wins the name"
+    );
     let has_conflict = std::fs::read_dir(&local)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -252,15 +315,31 @@ async fn nested_dirs_sync() {
     let (local, remote) = (tmpdir("l"), tmpdir("r"));
     put(&local, "src/deep/a.rs", "fn main(){}", 1000);
     sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
-    assert_eq!(read(&remote, "src/deep/a.rs").as_deref(), Some("fn main(){}"), "nested path recreated remotely");
+    assert_eq!(
+        read(&remote, "src/deep/a.rs").as_deref(),
+        Some("fn main(){}"),
+        "nested path recreated remotely"
+    );
 }
 
 #[tokio::test]
 async fn dry_run_changes_nothing() {
     let (local, remote) = (tmpdir("l"), tmpdir("r"));
     put(&local, "a.txt", "L", 1000);
-    let opts = sftp_sync::SyncOptions { dry_run: true, ..Default::default() };
-    let out = sftp_sync::sync_once(&LocalFs, remote.to_str().unwrap(), &local, &sftp_sync::Tree::new(), &opts, "h").await.unwrap();
+    let opts = sftp_sync::SyncOptions {
+        dry_run: true,
+        ..Default::default()
+    };
+    let out = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
 
     assert_eq!(out.changed, 0);
     assert_eq!(out.report.pushed, 1, "reports intended push");
@@ -272,11 +351,30 @@ async fn push_only_ignores_remote_side() {
     let (local, remote) = (tmpdir("l"), tmpdir("r"));
     put(&local, "mine.txt", "L", 1000);
     put(&remote, "theirs.txt", "R", 1000);
-    let opts = sftp_sync::SyncOptions { direction: sftp_sync::Direction::PushOnly, ..Default::default() };
-    let out = sftp_sync::sync_once(&LocalFs, remote.to_str().unwrap(), &local, &sftp_sync::Tree::new(), &opts, "h").await.unwrap();
+    let opts = sftp_sync::SyncOptions {
+        direction: sftp_sync::Direction::PushOnly,
+        ..Default::default()
+    };
+    let out = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(read(&remote, "mine.txt").as_deref(), Some("L"), "local pushed");
-    assert!(read(&local, "theirs.txt").is_none(), "remote-only NOT pulled");
+    assert_eq!(
+        read(&remote, "mine.txt").as_deref(),
+        Some("L"),
+        "local pushed"
+    );
+    assert!(
+        read(&local, "theirs.txt").is_none(),
+        "remote-only NOT pulled"
+    );
     assert_eq!(out.report.pulled, 0);
 }
 
@@ -289,14 +387,38 @@ async fn failed_push_does_not_poison_baseline() {
     put(&local, "keep.txt", "precious", 1000);
 
     let opts = sftp_sync::SyncOptions::default();
-    let out = sftp_sync::sync_once(&FailingPush, remote.to_str().unwrap(), &local, &sftp_sync::Tree::new(), &opts, "h").await.unwrap();
-    assert!(!out.baseline.contains_key("keep.txt"), "failed push must not enter the baseline");
-    assert_eq!(out.errors.len(), 1, "the failed action is returned to the caller");
+    let out = sftp_sync::sync_once(
+        &FailingPush,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !out.baseline.contains_key("keep.txt"),
+        "failed push must not enter the baseline"
+    );
+    assert_eq!(
+        out.errors.len(),
+        1,
+        "the failed action is returned to the caller"
+    );
 
     // Next run with a working backend + deletes on: the file must be pushed, never deleted.
     let out2 = sync(&remote, &local, &out.baseline, true).await;
-    assert_eq!(read(&remote, "keep.txt").as_deref(), Some("precious"), "retried push lands");
-    assert_eq!(read(&local, "keep.txt").as_deref(), Some("precious"), "local file survives");
+    assert_eq!(
+        read(&remote, "keep.txt").as_deref(),
+        Some("precious"),
+        "retried push lands"
+    );
+    assert_eq!(
+        read(&local, "keep.txt").as_deref(),
+        Some("precious"),
+        "local file survives"
+    );
     assert!(out2.baseline.contains_key("keep.txt"));
 }
 
@@ -321,16 +443,21 @@ async fn failed_remote_publish_restores_the_previous_file() {
 
     assert_eq!(read(&remote, "a.txt").as_deref(), Some("old"));
     assert_eq!(out.errors.len(), 1);
-    assert!(std::fs::read_dir(&remote)
-        .unwrap()
-        .filter_map(Result::ok)
-        .all(|entry| !entry.file_name().to_string_lossy().ends_with(".sync-tmp")));
+    assert!(
+        std::fs::read_dir(&remote)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".sync-tmp"))
+    );
 }
 
 #[tokio::test]
 async fn pull_does_not_follow_a_preexisting_staging_symlink() {
     let (local, remote) = (tmpdir("l"), tmpdir("r"));
-    let canary = local.parent().unwrap().join(format!("sync-canary-{}", std::process::id()));
+    let canary = local
+        .parent()
+        .unwrap()
+        .join(format!("sync-canary-{}", std::process::id()));
     std::fs::write(&canary, "untouched").unwrap();
     std::os::unix::fs::symlink(&canary, local.join("doc.txt.sync-tmp")).unwrap();
     put(&remote, "doc.txt", "downloaded", 1000);
@@ -340,14 +467,24 @@ async fn pull_does_not_follow_a_preexisting_staging_symlink() {
     assert!(out.errors.is_empty());
     assert_eq!(read(&local, "doc.txt").as_deref(), Some("downloaded"));
     assert_eq!(std::fs::read_to_string(&canary).unwrap(), "untouched");
-    assert!(local.join("doc.txt.sync-tmp").symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(
+        local
+            .join("doc.txt.sync-tmp")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     let _ = std::fs::remove_file(&canary);
 }
 
 #[tokio::test]
 async fn sync_does_not_overwrite_symlink_paths() {
     let (local, remote) = (tmpdir("l"), tmpdir("r"));
-    let canary = local.parent().unwrap().join(format!("sync-link-canary-{}", std::process::id()));
+    let canary = local
+        .parent()
+        .unwrap()
+        .join(format!("sync-link-canary-{}", std::process::id()));
     std::fs::write(&canary, "untouched").unwrap();
     put(&local, "remote-link", "local file", 1000);
     std::os::unix::fs::symlink(&canary, remote.join("remote-link")).unwrap();
@@ -358,8 +495,22 @@ async fn sync_does_not_overwrite_symlink_paths() {
 
     assert!(out.errors.is_empty());
     assert_eq!(std::fs::read_to_string(&canary).unwrap(), "untouched");
-    assert!(remote.join("remote-link").symlink_metadata().unwrap().file_type().is_symlink());
-    assert!(local.join("local-link").symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(
+        remote
+            .join("remote-link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        local
+            .join("local-link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(out.changed, 0);
     let _ = std::fs::remove_file(&canary);
 }
@@ -378,9 +529,19 @@ async fn file_becoming_symlink_does_not_delete_other_side() {
     std::os::unix::fs::symlink("/etc/hostname", local.join("doc.txt")).unwrap();
 
     let out2 = sync(&remote, &local, &out.baseline, true).await;
-    assert_eq!(read(&remote, "doc.txt").as_deref(), Some("precious"), "intact remote file survives");
-    assert_eq!(out2.report.deleted_remote, 0, "no deletion planned for a symlink-shadowed path");
-    assert!(out2.baseline.contains_key("doc.txt"), "baseline keeps the path");
+    assert_eq!(
+        read(&remote, "doc.txt").as_deref(),
+        Some("precious"),
+        "intact remote file survives"
+    );
+    assert_eq!(
+        out2.report.deleted_remote, 0,
+        "no deletion planned for a symlink-shadowed path"
+    );
+    assert!(
+        out2.baseline.contains_key("doc.txt"),
+        "baseline keeps the path"
+    );
 }
 
 #[tokio::test]
@@ -392,10 +553,22 @@ async fn hostile_remote_names_cannot_escape_root() {
     let _ = std::fs::remove_file(&canary);
 
     let tree = sftp_sync::scan_remote(&HostileFs, "/base").await.unwrap();
-    assert_eq!(tree.keys().cloned().collect::<Vec<_>>(), vec!["ok.txt".to_string()]);
+    assert_eq!(
+        tree.keys().cloned().collect::<Vec<_>>(),
+        vec!["ok.txt".to_string()]
+    );
 
     let opts = sftp_sync::SyncOptions::default();
-    sftp_sync::sync_once(&HostileFs, "/base", &local, &sftp_sync::Tree::new(), &opts, "h").await.unwrap();
+    sftp_sync::sync_once(
+        &HostileFs,
+        "/base",
+        &local,
+        &sftp_sync::Tree::new(),
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
     assert!(!canary.exists(), "no write escaped the local root");
     assert!(local.join("ok.txt").exists(), "safe file pulled");
 }

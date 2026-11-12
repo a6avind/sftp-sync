@@ -3,17 +3,15 @@
 //! to its request by id; requests serialize writes behind a mutex.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
-use super::protocol::{
-    CheckFile, File as NameFile, FileAttributes, OpenFlags, Status, StatusCode,
-};
-use super::{fxp, frame, read_packet, Cursor, PacketBuf, SFTP_VERSION};
+use super::protocol::{CheckFile, File as NameFile, FileAttributes, OpenFlags, Status, StatusCode};
+use super::{Cursor, PacketBuf, SFTP_VERSION, frame, fxp, read_packet};
 
 pub use error::Error;
 
@@ -257,7 +255,10 @@ impl SftpSession {
         let dir = path.to_owned();
         let entries: Vec<DirEntry> = entries
             .into_iter()
-            .map(|file| DirEntry { dir: dir.clone(), file })
+            .map(|file| DirEntry {
+                dir: dir.clone(),
+                file,
+            })
             .collect();
         Ok(ReadDir(entries.into_iter()))
     }
@@ -378,8 +379,13 @@ impl SftpSession {
         match self.request(id, b.0).await? {
             Reply::Extended(data) => {
                 let mut cur = Cursor::new(&data);
-                let algo = cur.string().map_err(|_| proto_err("bad check-file reply"))?;
-                Ok(CheckFile { hash_algorithm: algo, hashes: cur.rest().to_vec() })
+                let algo = cur
+                    .string()
+                    .map_err(|_| proto_err("bad check-file reply"))?;
+                Ok(CheckFile {
+                    hash_algorithm: algo,
+                    hashes: cur.rest().to_vec(),
+                })
             }
             Reply::Status(s) if s.status_code == StatusCode::OpUnsupported => {
                 Err(Error::Unsupported(s.error_message))
@@ -403,7 +409,9 @@ async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, inner: Arc<Inner>) {
         // Recover the id first so a malformed body still wakes its waiter with an
         // error rather than hanging it until the connection drops.
         let mut head = Cursor::new(&body);
-        let (Ok(_ty), Ok(id)) = (head.u8(), head.u32()) else { continue };
+        let (Ok(_ty), Ok(id)) = (head.u8(), head.u32()) else {
+            continue;
+        };
         if let Some((_, tx)) = inner.pending.remove(&id) {
             let reply = parse_reply(&body).map(|(_, r)| r).unwrap_or_else(|| {
                 Reply::Status(Status {
@@ -448,7 +456,11 @@ fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
                 let filename = cur.string().ok()?;
                 let longname = cur.string().ok()?;
                 let attrs = FileAttributes::decode(&mut cur).ok()?;
-                files.push(NameFile { filename, longname, attrs });
+                files.push(NameFile {
+                    filename,
+                    longname,
+                    attrs,
+                });
             }
             Reply::Name(files)
         }
@@ -520,7 +532,14 @@ pub mod fs {
 
     impl File {
         pub(super) fn new(session: SftpSession, handle: String) -> Self {
-            File { session, handle, offset: 0, closed: false, op: None, close_op: None }
+            File {
+                session,
+                handle,
+                offset: 0,
+                closed: false,
+                op: None,
+                close_op: None,
+            }
         }
 
         /// Close the remote handle, awaiting the server's CLOSE acknowledgement.
@@ -558,7 +577,9 @@ pub mod fs {
                 let s = this.session.clone();
                 let h = this.handle.clone();
                 let off = this.offset;
-                this.op = Some(Box::pin(async move { s.read_at(&h, off, want).await.map_err(io_err) }));
+                this.op = Some(Box::pin(async move {
+                    s.read_at(&h, off, want).await.map_err(io_err)
+                }));
             }
             let fut = this.op.as_mut().unwrap();
             match Pin::new(fut).poll(cx) {
@@ -594,7 +615,10 @@ pub mod fs {
                 let off = this.offset;
                 let chunk = buf[..n].to_vec();
                 this.op = Some(Box::pin(async move {
-                    s.write_at(&h, off, &chunk).await.map(|_| Vec::new()).map_err(io_err)
+                    s.write_at(&h, off, &chunk)
+                        .await
+                        .map(|_| Vec::new())
+                        .map_err(io_err)
                 }));
             }
             let fut = this.op.as_mut().unwrap();

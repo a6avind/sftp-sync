@@ -5,7 +5,7 @@
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::protocol::{Attrs, Data, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode};
-use super::{frame, fxp, read_packet, Cursor, PacketBuf, SFTP_VERSION};
+use super::{Cursor, PacketBuf, SFTP_VERSION, frame, fxp, read_packet};
 
 /// Server-side request handler. Every method defaults to returning
 /// [`Handler::unimplemented`]; override the ones you support. All futures are
@@ -337,7 +337,12 @@ async fn dispatch<H: Handler>(handler: &mut H, body: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn err_status(id: u32, code: StatusCode) -> Status {
-    Status { id, status_code: code, error_message: String::new(), language_tag: "en-US".into() }
+    Status {
+        id,
+        status_code: code,
+        error_message: String::new(),
+        language_tag: "en-US".into(),
+    }
 }
 
 fn enc_status(s: &Status) -> Vec<u8> {
