@@ -38,7 +38,11 @@ struct Verifier {
 
 impl client::Handler for Verifier {
     type Error = russh::Error;
-    async fn check_server_key(&mut self, key: &russh::keys::ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        key: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let key = key.public_key();
         Ok(match &self.expected {
             HostKey::AcceptAny => true,
             HostKey::Fingerprint(fp) => key.fingerprint(HashAlg::Sha256).to_string() == *fp,
