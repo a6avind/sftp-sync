@@ -38,7 +38,7 @@ async fn run(fs: &impl sftp_sync::RemoteFs) {
     loop {
         let opts = sftp_sync::SyncOptions::default(); // git, allow_delete, direction, dry_run
         let out = sftp_sync::sync_once(fs, "/remote/project", local, &base, &opts, "host").await.unwrap();
-        // out.report -> { pushed, pulled, deleted_remote, deleted_local, conflicts }
+        // Check out.errors; successful actions are reflected in out.baseline.
         if out.baseline != base {
             base = out.baseline;
             sftp_sync::save_baseline(&state, &base);
@@ -65,7 +65,7 @@ handler-driven in-process server (`server::run` + the `server::Handler` trait),
 useful for tests or loopback. `SftpFs` is the sync-focused wrapper over it.
 
 ```toml
-sftp-sync = { version = "0.1", features = ["sftp"] }
+sftp-sync = { version = "0.2", features = ["sftp"] }
 ```
 
 ```rust
@@ -123,7 +123,7 @@ converts via `?`.
 
 Every transfer is written to a temp path and renamed over the target, so an
 interrupted push can't leave a truncated file. `sync_once` returns an `Outcome`
-with the new baseline + a `Report` of what happened.
+with the new baseline, planned action counts, and per-action errors.
 
 ## Notes
 

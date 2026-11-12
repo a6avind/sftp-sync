@@ -154,11 +154,22 @@ impl RemoteFs for SftpFs {
         self.sftp.rename(from, to).await.map_err(be)
     }
 
-    /// Non-recursive (parents must exist); errors ignored for idempotency, so a
-    /// real failure surfaces later at the dependent create/rename.
+    /// Non-recursive (parents must exist); generic SFTP v3 failures are accepted
+    /// only when STAT confirms that the existing path is actually a directory.
     async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
-        let _ = self.sftp.create_dir(path).await;
-        Ok(())
+        use crate::proto::client::error::Error as E;
+        use crate::proto::protocol::StatusCode;
+        match self.sftp.create_dir(path).await {
+            Ok(()) => Ok(()),
+            Err(E::Status(s)) if s.status_code == StatusCode::Failure => {
+                match self.sftp.metadata(path).await {
+                    Ok(attrs) if attrs.is_dir() => Ok(()),
+                    Ok(_) => Err(SyncError::backend(format!("{path} exists and is not a directory"))),
+                    Err(e) => Err(SyncError::backend(format!("mkdir {path}: {e}"))),
+                }
+            }
+            Err(e) => Err(be(e)),
+        }
     }
 }
 

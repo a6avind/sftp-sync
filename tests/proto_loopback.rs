@@ -65,17 +65,18 @@ impl server::Handler for Mem {
         let prefix = if path.ends_with('/') { path.clone() } else { format!("{path}/") };
         let mut entries = Vec::new();
         for (name, buf) in &self.fs.files {
-            if let Some(rest) = name.strip_prefix(&prefix) {
-                if !rest.contains('/') {
-                    entries.push((rest.to_string(), Mem::file_attrs(buf.len() as u64)));
-                }
+            if let Some(rest) = name.strip_prefix(&prefix)
+                && !rest.contains('/')
+            {
+                entries.push((rest.to_string(), Mem::file_attrs(buf.len() as u64)));
             }
         }
         for d in &self.fs.dirs {
-            if let Some(rest) = d.strip_prefix(&prefix) {
-                if !rest.is_empty() && !rest.contains('/') {
-                    entries.push((rest.to_string(), Mem::dir_attrs()));
-                }
+            if let Some(rest) = d.strip_prefix(&prefix)
+                && !rest.is_empty()
+                && !rest.contains('/')
+            {
+                entries.push((rest.to_string(), Mem::dir_attrs()));
             }
         }
         let h = self.alloc();

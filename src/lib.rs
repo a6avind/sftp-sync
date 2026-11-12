@@ -120,6 +120,14 @@ pub struct Meta {
 /// Relative-path → metadata map of a tree's files (directories are implicit).
 pub type Tree = BTreeMap<String, Meta>;
 
+struct RemoveFileOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Push(String),
@@ -197,8 +205,10 @@ pub struct Outcome {
     pub baseline: Tree,
     /// Number of actions applied this cycle (0 on `dry_run`).
     pub changed: usize,
-    /// Per-category breakdown of the plan (applied, or intended on `dry_run`).
+    /// Planned action counts; failures are listed in `errors`.
     pub report: Report,
+    /// Per-action failures; successful actions remain reflected in `baseline`.
+    pub errors: Vec<String>,
 }
 
 fn filter_direction(acts: Vec<Action>, dir: Direction) -> Vec<Action> {
@@ -283,9 +293,9 @@ pub async fn sync_once<R: RemoteFs>(
     opts: &SyncOptions,
     host: &str,
 ) -> Result<Outcome, SyncError> {
-    // Skip on pull-only: silently creating a missing source could delete-local everything.
+    // Pull-only must not create a missing source and then read it as empty.
     if !opts.dry_run && opts.direction != Direction::PullOnly {
-        let _ = fs.mkdir(base_remote).await;
+        fs.mkdir(base_remote).await?;
     }
     // Walking a large tree is the single biggest blocking chunk in the cycle;
     // offload it so it can't stall the runtime thread (and thus the co-located
@@ -300,10 +310,10 @@ pub async fn sync_once<R: RemoteFs>(
     let (remote, remote_sym) = scan_remote_shadowed(fs, base_remote).await?;
     let allow = opts.allow_delete && !baseline.is_empty(); // first run never deletes
     let mut acts = filter_direction(reconcile(&local, &remote, baseline, allow), opts.direction);
-    // A path that turned into a symlink drops out of its side's file tree; without
-    // this it looks like a deletion and wipes the intact file on the other side.
-    // The symlink still occupies the path, so suppress the delete (stable no-op).
+    // Never delete or overwrite a path occupied by a symlink on either side.
     acts.retain(|a| match a {
+        Action::Push(rel) => !remote_sym.contains(rel),
+        Action::Pull(rel) => !local_sym.contains(rel),
         Action::DelLocal(rel) => !remote_sym.contains(rel),
         Action::DelRemote(rel) => !local_sym.contains(rel),
         _ => true,
@@ -311,22 +321,22 @@ pub async fn sync_once<R: RemoteFs>(
     let report = Report::tally(&acts);
 
     if opts.dry_run {
-        return Ok(Outcome { baseline: baseline.clone(), changed: 0, report });
+        return Ok(Outcome { baseline: baseline.clone(), changed: 0, report, errors: Vec::new() });
     }
-    // Advance the baseline only for actions that landed: a path recorded as synced
-    // after a failed transfer reads next cycle as a remote-side delete → local data loss.
+    // Advance only successful actions to avoid treating failed transfers as deletions.
     let mut new_base = baseline.clone();
     let mut changed = 0usize;
+    let mut errors = Vec::new();
     for a in &acts {
         match apply(fs, base_remote, local_root, a, host, &remote).await {
             Ok(()) => {
                 commit_baseline(&mut new_base, a, &local, &remote);
                 changed += 1;
             }
-            Err(e) => eprintln!("sftp-sync: {a:?} failed: {e}"),
+            Err(e) => errors.push(format!("{a:?}: {e}")),
         }
     }
-    Ok(Outcome { baseline: new_base, changed, report })
+    Ok(Outcome { baseline: new_base, changed, report, errors })
 }
 
 /// Fold one successfully-applied action into the running baseline, deriving the
@@ -352,7 +362,7 @@ fn commit_baseline(base: &mut Tree, a: &Action, local: &Tree, remote: &Tree) {
 async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, host: &str, remote: &Tree) -> Result<(), SyncError> {
     let rmtime = |rel: &str| remote.get(rel).map(|m| m.mtime).unwrap_or(0);
     match a {
-        Action::Push(rel) => push(fs, base, local_root, rel).await,
+        Action::Push(rel) => push(fs, base, local_root, rel, remote.contains_key(rel)).await,
         Action::Pull(rel) => pull(fs, base, local_root, rel, rel, rmtime(rel)).await,
         Action::DelRemote(rel) => fs.remove_file(&join(base, rel)).await,
         Action::DelLocal(rel) => std::fs::remove_file(local_root.join(rel)).map_err(SyncError::from),
@@ -364,7 +374,7 @@ async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, h
             let tag = format!("{rel}.conflict-{host}-{}-{n}", now_secs());
             if *local_newer {
                 pull(fs, base, local_root, rel, &tag, rmtime(rel)).await?; // save remote aside
-                push(fs, base, local_root, rel).await // local wins
+                push(fs, base, local_root, rel, remote.contains_key(rel)).await // local wins
             } else {
                 copy_local(local_root, rel, &tag)?; // save local aside
                 pull(fs, base, local_root, rel, rel, rmtime(rel)).await // remote wins
@@ -373,22 +383,43 @@ async fn apply<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, a: &Action, h
     }
 }
 
-async fn push<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, rel: &str) -> Result<(), SyncError> {
+async fn push<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, rel: &str, destination_exists: bool) -> Result<(), SyncError> {
     let lpath = local_root.join(rel);
     let rpath = join(base, rel);
-    ensure_remote_dirs(fs, base, rel).await;
+    ensure_remote_dirs(fs, base, rel).await?;
     let mtime = local_mtime_secs(&lpath);
-    // Write to a temp path then rename over the target: an interrupted transfer
-    // leaves the `.sync-tmp` (skipped by scans), never a truncated real file.
+    // Stage uploads so interrupted transfers never truncate the destination.
     let tmp = format!("{rpath}.sync-tmp");
+    let backup = format!("{rpath}.sync-backup.sync-tmp");
     let mut lf = tokio::fs::File::open(&lpath).await?;
     let mut w = fs.create(&tmp).await?;
-    tokio::io::copy(&mut lf, &mut w).await?;
-    w.shutdown().await?; // flush + close (adapter awaits SFTP CLOSE)
-    drop(w);
-    let _ = fs.set_mtime(&tmp, mtime).await;
-    let _ = fs.remove_file(&rpath).await; // rename may not overwrite; single-writer so safe
-    fs.rename(&tmp, &rpath).await
+    let transfer = async {
+        tokio::io::copy(&mut lf, &mut w).await?;
+        w.shutdown().await?; // flush + close (adapter awaits SFTP CLOSE)
+        drop(w);
+        let _ = fs.set_mtime(&tmp, mtime).await;
+        if destination_exists {
+            fs.rename(&rpath, &backup).await?;
+        }
+        if let Err(error) = fs.rename(&tmp, &rpath).await {
+            if destination_exists
+                && let Err(restore) = fs.rename(&backup, &rpath).await
+            {
+                return Err(SyncError::backend(format!(
+                    "publish failed ({error}); restoring previous file also failed ({restore}); backup remains at {backup}"
+                )));
+            }
+            return Err(error);
+        }
+        if destination_exists {
+            let _ = fs.remove_file(&backup).await;
+        }
+        Ok(())
+    }.await;
+    if transfer.is_err() {
+        let _ = fs.remove_file(&tmp).await;
+    }
+    transfer
 }
 
 async fn pull<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, src_rel: &str, dst_rel: &str, mtime: i64) -> Result<(), SyncError> {
@@ -397,14 +428,33 @@ async fn pull<R: RemoteFs>(fs: &R, base: &str, local_root: &Path, src_rel: &str,
     if let Some(parent) = lpath.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Write to a temp path then rename over the target: an interrupted transfer
-    // leaves a `.sync-tmp` (skipped by scans), never a truncated real file that
-    // would reconcile next cycle as the newer side and overwrite the good remote.
-    let mut tmp = lpath.clone().into_os_string();
-    tmp.push(".sync-tmp");
-    let tmp = std::path::PathBuf::from(tmp);
+    // Create a unique sibling without following a pre-existing symlink.
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut created = None;
+    for _ in 0..128 {
+        let seq = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = lpath.as_os_str().to_os_string();
+        name.push(format!(".flow-{}-{seq}.sync-tmp", std::process::id()));
+        let candidate = std::path::PathBuf::from(name);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (tmp, mut lf) = created.ok_or_else(|| {
+        SyncError::backend("could not allocate a unique local staging file")
+    })?;
+    let _cleanup = RemoveFileOnDrop(tmp.clone());
     let mut r = fs.open_read(&rpath).await?;
-    let mut lf = tokio::fs::File::create(&tmp).await?;
     tokio::io::copy(&mut r, &mut lf).await?;
     lf.flush().await?;
     drop(lf);
@@ -417,13 +467,15 @@ fn copy_local(local_root: &Path, rel: &str, dst_rel: &str) -> Result<(), SyncErr
     std::fs::copy(local_root.join(rel), local_root.join(dst_rel)).map(|_| ()).map_err(SyncError::from)
 }
 
-async fn ensure_remote_dirs<R: RemoteFs>(fs: &R, base: &str, rel: &str) {
-    let parts: Vec<&str> = rel.split('/').collect();
-    let mut cur = base.to_string();
-    for p in &parts[..parts.len().saturating_sub(1)] {
-        cur = join(&cur, p);
-        let _ = fs.mkdir(&cur).await;
+async fn ensure_remote_dirs<R: RemoteFs>(fs: &R, base: &str, rel: &str) -> Result<(), SyncError> {
+    if let Some((parents, _)) = rel.rsplit_once('/') {
+        let mut cur = base.to_string();
+        for parent in parents.split('/') {
+            cur = join(&cur, parent);
+            fs.mkdir(&cur).await?;
+        }
     }
+    Ok(())
 }
 
 // ---- scanning ---------------------------------------------------------------
@@ -552,7 +604,11 @@ fn is_skippable(rel: &str) -> bool {
 pub fn state_file(host: &str, base_remote: &str, local_root: &Path) -> std::path::PathBuf {
     let key = format!("{host}\0{base_remote}\0{}", local_root.display());
     let digest = <sha2::Sha256 as sha2::Digest>::digest(key.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
     let dir = config_dir().join("sftp-sync");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{hex}.json"))

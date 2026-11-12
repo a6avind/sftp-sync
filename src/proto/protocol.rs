@@ -297,10 +297,10 @@ impl File {
     }
     pub fn file_type(&self) -> FileType {
         let ty = self.attrs.file_type();
-        if ty.is_other() {
-            if let Some(from_ln) = FileType::from_longname(&self.longname) {
-                return from_ln;
-            }
+        if ty.is_other()
+            && let Some(from_ln) = FileType::from_longname(&self.longname)
+        {
+            return from_ln;
         }
         ty
     }
