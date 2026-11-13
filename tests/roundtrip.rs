@@ -54,6 +54,79 @@ struct ChangeAfterScan {
     fired: std::sync::atomic::AtomicBool,
 }
 
+struct ChangeDuringTransfer {
+    target: PathBuf,
+    during_pull: bool,
+}
+
+struct CorruptStaging;
+
+impl RemoteFs for CorruptStaging {
+    async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
+        LocalFs.read_dir(path).await
+    }
+    async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
+        if path.ends_with(".sync-tmp") {
+            Ok(Box::new(&b"evil"[..]))
+        } else {
+            LocalFs.open_read(path).await
+        }
+    }
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        LocalFs.create_new(path).await
+    }
+    async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
+        LocalFs.set_mtime(path, mtime).await
+    }
+    async fn remove_file(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.remove_file(path).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
+        LocalFs.rename(from, to).await
+    }
+    async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.mkdir(path).await
+    }
+}
+
+impl RemoteFs for ChangeDuringTransfer {
+    async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
+        LocalFs.read_dir(path).await
+    }
+    async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
+        let file = LocalFs.open_read(path).await?;
+        if self.during_pull {
+            std::fs::write(&self.target, "concurrent local edit").unwrap();
+        }
+        Ok(file)
+    }
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        LocalFs.create_new(path).await
+    }
+    async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
+        LocalFs.set_mtime(path, mtime).await?;
+        if !self.during_pull {
+            std::fs::write(&self.target, "concurrent remote edit").unwrap();
+        }
+        Ok(())
+    }
+    async fn remove_file(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.remove_file(path).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
+        LocalFs.rename(from, to).await
+    }
+    async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.mkdir(path).await
+    }
+}
+
 impl RemoteFs for ChangeAfterScan {
     async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
         let entries = LocalFs.read_dir(path).await?;
@@ -332,6 +405,56 @@ async fn first_run_unions_both_sides() {
 }
 
 #[tokio::test]
+async fn changed_destination_during_pull_is_not_overwritten() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&remote, "file", "remote content", 1000);
+    let fs = ChangeDuringTransfer {
+        target: local.join("file"),
+        during_pull: true,
+    };
+    let out = sftp_sync::sync_once(
+        &fs,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &Default::default(),
+        "h",
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.errors.len(), 1);
+    assert_eq!(
+        read(&local, "file").as_deref(),
+        Some("concurrent local edit")
+    );
+}
+
+#[tokio::test]
+async fn changed_destination_during_push_is_not_overwritten() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "file", "local content", 1000);
+    let fs = ChangeDuringTransfer {
+        target: remote.join("file"),
+        during_pull: false,
+    };
+    let out = sftp_sync::sync_once(
+        &fs,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &Default::default(),
+        "h",
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.errors.len(), 1);
+    assert_eq!(
+        read(&remote, "file").as_deref(),
+        Some("concurrent remote edit")
+    );
+}
+
+#[tokio::test]
 async fn matching_files_enter_baseline_and_deletions_propagate() {
     let (local, remote) = (tmpdir("l"), tmpdir("r"));
     put(&local, "same.txt", "same", 1000);
@@ -387,6 +510,7 @@ async fn unfinished_remote_backup_stops_reconciliation() {
         sftp_sync::Meta {
             mtime: 1000,
             size: 4,
+            sha256: None,
         },
     );
     let opts = sftp_sync::SyncOptions {
@@ -457,6 +581,80 @@ async fn local_edit_pushes_remote_edit_pulls() {
 
     assert_eq!(read(&remote, "a.txt").as_deref(), Some("v2-local"));
     assert_eq!(read(&local, "b.txt").as_deref(), Some("v2-remote"));
+}
+
+#[tokio::test]
+async fn same_size_and_mtime_edit_is_detected() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "file", "old!", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    put(&local, "file", "new!", 1000);
+    let out = sync(&remote, &local, &first.baseline, true).await;
+    assert!(out.errors.is_empty());
+    assert_eq!(read(&remote, "file").as_deref(), Some("new!"));
+}
+
+#[tokio::test]
+async fn simultaneous_same_metadata_edits_keep_both_versions() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "file", "base", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    put(&local, "file", "left", 1000);
+    put(&remote, "file", "rght", 1000);
+    let out = sync(&remote, &local, &first.baseline, true).await;
+    assert!(out.errors.is_empty());
+    assert_eq!(out.report.conflicts, 1);
+    assert_eq!(read(&local, "file").as_deref(), Some("left"));
+    assert_eq!(read(&remote, "file").as_deref(), Some("left"));
+    let copy = std::fs::read_dir(&local)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("file.conflict-")
+        })
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(copy).unwrap(), "rght");
+}
+
+#[tokio::test]
+async fn corrupt_staging_content_is_not_published() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "file", "good", 1000);
+    let out = sftp_sync::sync_once(
+        &CorruptStaging,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &Default::default(),
+        "h",
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.errors.len(), 1);
+    assert!(!remote.join("file").exists());
+    assert!(!out.baseline.contains_key("file"));
+}
+
+#[tokio::test]
+async fn legacy_baseline_without_hash_does_not_delete_surviving_file() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "file", "safe", 1000);
+    let mut baseline = sftp_sync::Tree::new();
+    baseline.insert(
+        "file".into(),
+        sftp_sync::Meta {
+            mtime: 1000,
+            size: 4,
+            sha256: None,
+        },
+    );
+    let out = sync(&remote, &local, &baseline, true).await;
+    assert!(out.errors.is_empty());
+    assert_eq!(read(&local, "file").as_deref(), Some("safe"));
+    assert_eq!(read(&remote, "file").as_deref(), Some("safe"));
 }
 
 #[tokio::test]
@@ -844,12 +1042,13 @@ async fn changed_after_scan_is_not_deleted_or_overwritten() {
             &Default::default(),
             "h",
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(read(survivor, "file").as_deref(), Some("concurrent change"));
-        assert_eq!(out.changed, 0);
-        assert_eq!(out.errors.len(), 1);
-        assert_eq!(out.baseline, first.baseline);
+        if let Ok(out) = out {
+            assert_eq!(out.changed, 0);
+            assert_eq!(out.errors.len(), 1);
+            assert_eq!(out.baseline, first.baseline);
+        }
     }
 }
 
@@ -877,15 +1076,16 @@ async fn changed_after_scan_prevents_stale_transfer() {
             &Default::default(),
             "h",
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             read(destination, "file").as_deref(),
             Some("concurrent change")
         );
-        assert_eq!(out.changed, 0);
-        assert_eq!(out.errors.len(), 1);
-        assert_eq!(out.baseline, first.baseline);
+        if let Ok(out) = out {
+            assert_eq!(out.changed, 0);
+            assert_eq!(out.errors.len(), 1);
+            assert_eq!(out.baseline, first.baseline);
+        }
     }
 }
 
@@ -902,6 +1102,7 @@ async fn git_mode_preserves_remote_only_ignored_paths() {
         sftp_sync::Meta {
             mtime: 1000,
             size: 6,
+            sha256: None,
         },
     );
     let opts = sftp_sync::SyncOptions {

@@ -65,7 +65,7 @@ handler-driven in-process server (`server::run` + the `server::Handler` trait),
 useful for tests or loopback. `SftpFs` is the sync-focused wrapper over it.
 
 ```toml
-sftp-sync = { version = "0.4", features = ["sftp"] }
+sftp-sync = { version = "0.5", features = ["sftp"] }
 ```
 
 ```rust
@@ -130,8 +130,11 @@ with the new baseline, planned action counts, and per-action errors.
 - `git = true` honours `.gitignore` (and global/exclude) on the local walk.
 - Symlinks are skipped; directories are implicit.
 - Transfers require successful timestamp preservation before publication.
-- Files are compared by size and whole-second mtime, not content hashes; changes
-  that preserve both can be missed. Sync is not a replacement for backups.
+- Files are checked with SHA-256 as well as size and mtime. Each scan reads all
+  file contents on both sides, which can be expensive over SFTP.
+- Baselines from older versions lack hashes; one-sided survivors are copied
+  rather than deleted until verified.
+- `Meta` now includes `sha256`; callers constructing it directly must set that field.
 - Revalidation reduces, but cannot eliminate, races with files changed during a
   sync. Avoid concurrent edits when strong consistency is required.
 - Only one sync process should operate on a given pair of trees at a time.

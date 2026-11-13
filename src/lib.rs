@@ -28,7 +28,8 @@ use std::future::Future;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use sha2::Digest;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(feature = "sftp")]
 mod proto;
@@ -123,12 +124,14 @@ pub trait RemoteFs {
     fn mkdir(&self, path: &str) -> impl Future<Output = Result<(), SyncError>> + Send;
 }
 
-/// One tracked file: mtime (whole seconds) + size. Equality is the in-sync test;
-/// mtime is preserved on transfer so a synced pair compares equal.
+/// A tracked file's timestamp, size, and optional SHA-256 digest.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Debug)]
 pub struct Meta {
     pub mtime: i64,
     pub size: u64,
+    /// Missing on baselines written before content verification was introduced.
+    #[serde(default)]
+    pub sha256: Option<[u8; 32]>,
 }
 
 /// Relative-path → metadata map of a tree's files (directories are implicit).
@@ -421,7 +424,7 @@ pub async fn sync_once<R: RemoteFs>(
         // Best-effort validation only: neither backend exposes conditional
         // mutation, and metadata is only second-resolution mtime plus size.
         let validation = async {
-            let current_local = local_path_meta(local_root, rel)?;
+            let current_local = checked_local_meta(local_root, rel).await?;
             let current_remote = remote_path_meta(fs, base_remote, rel).await?;
             if (opts.git && ignored_absent_path(local_root, rel)?)
                 || current_local.as_ref() != local.get(rel)
@@ -433,7 +436,7 @@ pub async fn sync_once<R: RemoteFs>(
         }
         .await;
         let result = match validation {
-            Ok(()) => apply(fs, base_remote, local_root, a, host, &remote).await,
+            Ok(()) => apply(fs, base_remote, local_root, a, host, &local, &remote).await,
             Err(e) => Err(e),
         };
         match result {
@@ -459,9 +462,55 @@ fn is_shadowed(path: &str, symlinks: &BTreeSet<String>) -> bool {
             .any(|(i, _)| symlinks.contains(&path[..i]))
 }
 
-// These checks reduce the scan-to-action window, but are not conditional
-// filesystem operations. Same-size edits within one timestamp second and
-// changes after validation (including during transfer) remain undetectable.
+fn hash_local(path: &Path, expected: &std::fs::Metadata) -> Result<[u8; 32], SyncError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    if before.len() != expected.len() || before.modified()? != expected.modified()? {
+        return Err(SyncError::backend("local file changed before hashing"));
+    }
+    let mut hash = sha2::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Err(SyncError::backend("local file changed while hashing"));
+    }
+    Ok(hash.finalize().into())
+}
+
+async fn hash_remote<R: RemoteFs>(fs: &R, path: &str, size: u64) -> Result<[u8; 32], SyncError> {
+    let mut file = fs.open_read(path).await?;
+    let mut hash = sha2::Sha256::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        total = total
+            .checked_add(n as u64)
+            .ok_or_else(|| SyncError::backend("remote file size overflow"))?;
+        if total > size {
+            return Err(SyncError::backend("remote file changed while hashing"));
+        }
+        hash.update(&buf[..n]);
+    }
+    if total != size {
+        return Err(SyncError::backend("remote file changed while hashing"));
+    }
+    Ok(hash.finalize().into())
+}
+
+// Revalidation narrows the race window, but the backends cannot conditionally
+// replace or delete files atomically.
 fn local_path_meta(root: &Path, rel: &str) -> Result<Option<Meta>, SyncError> {
     let mut path = root.to_path_buf();
     let mut parts = rel.split('/').peekable();
@@ -489,12 +538,21 @@ fn local_path_meta(root: &Path, rel: &str) -> Result<Option<Meta>, SyncError> {
             return Ok(Some(Meta {
                 mtime,
                 size: meta.len(),
+                sha256: Some(hash_local(&path, &meta)?),
             }));
         } else {
             return Err(SyncError::backend("local path is not a regular file"));
         }
     }
     Ok(None)
+}
+
+async fn checked_local_meta(root: &Path, rel: &str) -> Result<Option<Meta>, SyncError> {
+    let root = root.to_path_buf();
+    let rel = rel.to_owned();
+    tokio::task::spawn_blocking(move || local_path_meta(&root, &rel))
+        .await
+        .map_err(SyncError::backend)?
 }
 
 async fn remote_path_meta<R: RemoteFs>(
@@ -521,6 +579,7 @@ async fn remote_path_meta<R: RemoteFs>(
             return Ok(Some(Meta {
                 mtime: entry.mtime,
                 size: entry.size,
+                sha256: Some(hash_remote(fs, &join(&dir, part), entry.size).await?),
             }));
         } else {
             return Err(SyncError::backend("remote path is a directory"));
@@ -666,12 +725,26 @@ async fn apply<R: RemoteFs>(
     local_root: &Path,
     a: &Action,
     host: &str,
+    local: &Tree,
     remote: &Tree,
 ) -> Result<(), SyncError> {
     let rmtime = |rel: &str| remote.get(rel).map(|m| m.mtime).unwrap_or(0);
+    let expected = |rel: &str| (local.get(rel).copied(), remote.get(rel).copied());
     match a {
-        Action::Push(rel) => push(fs, base, local_root, rel, remote.contains_key(rel)).await,
-        Action::Pull(rel) => pull(fs, base, local_root, rel, rel, rmtime(rel), false).await,
+        Action::Push(rel) => push(fs, base, local_root, rel, expected(rel)).await,
+        Action::Pull(rel) => {
+            pull(
+                fs,
+                base,
+                local_root,
+                rel,
+                rel,
+                rmtime(rel),
+                false,
+                expected(rel),
+            )
+            .await
+        }
         Action::DelRemote(rel) => fs.remove_file(&join(base, rel)).await,
         Action::DelLocal(rel) => {
             std::fs::remove_file(local_root.join(rel)).map_err(SyncError::from)
@@ -694,14 +767,51 @@ async fn apply<R: RemoteFs>(
                 .collect();
             let tag = format!("{rel}.conflict-{host}-{}-{n}", now_secs());
             if *local_newer {
-                pull(fs, base, local_root, rel, &tag, rmtime(rel), true).await?; // save remote aside
-                push(fs, base, local_root, rel, remote.contains_key(rel)).await // local wins
+                pull(
+                    fs,
+                    base,
+                    local_root,
+                    rel,
+                    &tag,
+                    rmtime(rel),
+                    true,
+                    expected(rel),
+                )
+                .await?;
+                push(fs, base, local_root, rel, expected(rel)).await
             } else {
                 copy_local(local_root, rel, &tag)?; // save local aside
-                pull(fs, base, local_root, rel, rel, rmtime(rel), false).await // remote wins
+                pull(
+                    fs,
+                    base,
+                    local_root,
+                    rel,
+                    rel,
+                    rmtime(rel),
+                    false,
+                    expected(rel),
+                )
+                .await
             }
         }
     }
+}
+
+async fn revalidate<R: RemoteFs>(
+    fs: &R,
+    base: &str,
+    local_root: &Path,
+    rel: &str,
+    expected: (Option<Meta>, Option<Meta>),
+) -> Result<(), SyncError> {
+    if checked_local_meta(local_root, rel).await? != expected.0
+        || remote_path_meta(fs, base, rel).await? != expected.1
+    {
+        return Err(SyncError::backend(
+            "path changed during transfer; retry sync",
+        ));
+    }
+    Ok(())
 }
 
 async fn push<R: RemoteFs>(
@@ -709,7 +819,7 @@ async fn push<R: RemoteFs>(
     base: &str,
     local_root: &Path,
     rel: &str,
-    destination_exists: bool,
+    expected: (Option<Meta>, Option<Meta>),
 ) -> Result<(), SyncError> {
     let lpath = local_root.join(rel);
     let rpath = join(base, rel);
@@ -728,6 +838,12 @@ async fn push<R: RemoteFs>(
         w.shutdown().await?; // flush + close (adapter awaits SFTP CLOSE)
         drop(w);
         fs.set_mtime(&tmp, mtime).await?;
+        let source = expected.0.ok_or_else(|| SyncError::backend("missing local source metadata"))?;
+        if source.sha256 != Some(hash_remote(fs, &tmp, source.size).await?) {
+            return Err(SyncError::backend("uploaded content does not match scanned source"));
+        }
+        revalidate(fs, base, local_root, rel, expected).await?;
+        let destination_exists = expected.1.is_some();
         if destination_exists {
             fs.rename(&rpath, &backup).await?;
         }
@@ -752,6 +868,7 @@ async fn push<R: RemoteFs>(
     transfer
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pull<R: RemoteFs>(
     fs: &R,
     base: &str,
@@ -760,6 +877,7 @@ async fn pull<R: RemoteFs>(
     dst_rel: &str,
     mtime: i64,
     exclusive: bool,
+    expected: (Option<Meta>, Option<Meta>),
 ) -> Result<(), SyncError> {
     let rpath = join(base, src_rel);
     let lpath = local_root.join(dst_rel);
@@ -796,6 +914,22 @@ async fn pull<R: RemoteFs>(
     lf.flush().await?;
     drop(lf);
     set_local_mtime(&tmp, mtime)?;
+    let source = expected
+        .1
+        .ok_or_else(|| SyncError::backend("missing remote source metadata"))?;
+    let staged_path = tmp.clone();
+    let staged_hash = tokio::task::spawn_blocking(move || {
+        let staged = std::fs::metadata(&staged_path)?;
+        hash_local(&staged_path, &staged)
+    })
+    .await
+    .map_err(SyncError::backend)??;
+    if source.sha256 != Some(staged_hash) {
+        return Err(SyncError::backend(
+            "downloaded content does not match scanned source",
+        ));
+    }
+    revalidate(fs, base, local_root, src_rel, expected).await?;
     if exclusive {
         // Publish without replacing an existing conflict copy or symlink.
         std::fs::hard_link(&tmp, &lpath)?;
@@ -893,6 +1027,7 @@ fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>
             Meta {
                 mtime,
                 size: m.len(),
+                sha256: Some(hash_local(entry.path(), &m)?),
             },
         );
     }
@@ -983,6 +1118,7 @@ async fn scan_remote_shadowed<R: RemoteFs>(
                     Meta {
                         mtime: e.mtime,
                         size: e.size,
+                        sha256: Some(hash_remote(fs, &join(&dir, &e.name), e.size).await?),
                     },
                 );
             }
@@ -1132,7 +1268,11 @@ mod tests {
     use super::*;
 
     fn m(mtime: i64, size: u64) -> Meta {
-        Meta { mtime, size }
+        Meta {
+            mtime,
+            size,
+            sha256: None,
+        }
     }
     fn t(pairs: &[(&str, Meta)]) -> Tree {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
