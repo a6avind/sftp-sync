@@ -33,7 +33,7 @@ enum Kind {
 
 struct Mem {
     fs: MemFs,
-    handles: HashMap<String, Kind>,
+    handles: HashMap<Vec<u8>, Kind>,
     counter: u32,
 }
 
@@ -46,8 +46,9 @@ impl Mem {
             language_tag: "en".into(),
         }
     }
-    fn alloc(&mut self) -> String {
-        let h = self.counter.to_string();
+    fn alloc(&mut self) -> Vec<u8> {
+        let mut h = vec![0xff, 0];
+        h.extend_from_slice(&self.counter.to_be_bytes());
         self.counter += 1;
         h
     }
@@ -120,7 +121,7 @@ impl server::Handler for Mem {
         );
         Ok(Handle { id, handle: h })
     }
-    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, StatusCode> {
+    async fn readdir(&mut self, id: u32, handle: Vec<u8>) -> Result<Name, StatusCode> {
         match self.handles.get_mut(&handle) {
             Some(Kind::Dir { entries, sent }) if !*sent => {
                 let files = entries
@@ -165,7 +166,7 @@ impl server::Handler for Mem {
     async fn read(
         &mut self,
         id: u32,
-        handle: String,
+        handle: Vec<u8>,
         offset: u64,
         len: u32,
     ) -> Result<Data, StatusCode> {
@@ -187,7 +188,7 @@ impl server::Handler for Mem {
     async fn write(
         &mut self,
         id: u32,
-        handle: String,
+        handle: Vec<u8>,
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, StatusCode> {
@@ -208,12 +209,13 @@ impl server::Handler for Mem {
             _ => Err(StatusCode::Failure),
         }
     }
-    async fn close(&mut self, id: u32, handle: String) -> Result<Status, StatusCode> {
-        if let Some(Kind::File {
+    async fn close(&mut self, id: u32, handle: Vec<u8>) -> Result<Status, StatusCode> {
+        let kind = self.handles.remove(&handle).ok_or(StatusCode::Failure)?;
+        if let Kind::File {
             path,
             buf,
             writable: true,
-        }) = self.handles.remove(&handle)
+        } = kind
         {
             self.fs.files.insert(path, buf);
         }
@@ -282,6 +284,30 @@ async fn session() -> SftpSession {
     };
     server::run(srv, mem).await;
     SftpSession::new(client).await.expect("client handshake")
+}
+
+#[tokio::test]
+async fn opaque_binary_handles_roundtrip() {
+    // Mem allocates handles beginning with invalid UTF-8 and an embedded NUL.
+    let s = session().await;
+    s.create_dir("/binary").await.unwrap();
+    let mut file = s.create("/binary/file").await.unwrap();
+    file.write_all(b"opaque").await.unwrap();
+    file.shutdown().await.unwrap();
+
+    let mut file = s.open("/binary/file").await.unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"opaque");
+    file.shutdown().await.unwrap();
+
+    let entries: Vec<_> = s
+        .read_dir("/binary")
+        .await
+        .unwrap()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(entries, ["file"]);
 }
 
 #[tokio::test]

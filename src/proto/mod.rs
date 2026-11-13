@@ -1,6 +1,7 @@
 //! A small, self-contained SFTP v3 implementation (client + server) over any
 //! `AsyncRead + AsyncWrite` stream, plus the ProFTPD `check-file` extension.
-//! Wire format is hand-encoded (no serde). Layout: [`protocol`] wire types,
+//! Wire format is hand-encoded (no serde); handles are opaque byte strings.
+//! Layout: [`protocol`] wire types,
 //! [`client`] the async client, [`server`] a handler-driven in-process test server.
 
 pub mod client;
@@ -133,7 +134,7 @@ impl<'a> Cursor<'a> {
         Ok(self.take(n)?.to_vec())
     }
     pub fn string(&mut self) -> Result<String, WireError> {
-        Ok(String::from_utf8_lossy(&self.bytes()?).into_owned())
+        String::from_utf8(self.bytes()?).map_err(|_| WireError)
     }
     pub fn rest(&mut self) -> &'a [u8] {
         let s = &self.buf[self.pos..];
@@ -142,6 +143,33 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// A packet ended before an expected field.
+/// A packet contained a truncated field or invalid UTF-8 where text was expected.
 #[derive(Debug)]
 pub(crate) struct WireError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_fields_reject_invalid_utf8_without_replacement() {
+        let mut packet = PacketBuf::new(0);
+        packet.string("valid \u{fffd}");
+        packet.bytes(&[0xff]);
+        let mut cur = Cursor::new(&packet.0[1..]);
+        assert_eq!(cur.string().unwrap(), "valid \u{fffd}");
+        assert!(cur.string().is_err());
+    }
+
+    #[test]
+    fn ignored_attribute_extensions_accept_binary_values() {
+        let mut packet = PacketBuf::new(0);
+        packet.u32(0x8000_0000);
+        packet.u32(1);
+        packet.bytes(&[0xff]);
+        packet.bytes(&[0xfe, 0]);
+        let mut cur = Cursor::new(&packet.0[1..]);
+        assert!(protocol::FileAttributes::decode(&mut cur).is_ok());
+        assert_eq!(cur.remaining(), 0);
+    }
+}

@@ -110,7 +110,7 @@ pub trait RemoteFs {
         &self,
         path: &str,
     ) -> impl Future<Output = Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError>> + Send;
-    /// Set a file's mtime (whole seconds). Best-effort; keeps synced pairs equal.
+    /// Set a file's mtime (whole seconds). Required to keep synced pairs equal.
     fn set_mtime(
         &self,
         path: &str,
@@ -171,7 +171,8 @@ pub enum Direction {
 /// Knobs for a sync run. Construct with `..Default::default()`.
 #[derive(Clone, Copy, Debug)]
 pub struct SyncOptions {
-    /// Honour `.gitignore` (and git global/exclude) on the local walk.
+    /// Honour `.ignore`, `.gitignore`, and git global/exclude rules on local and
+    /// remote-only paths. Ignore files must be readable to classify absent paths.
     pub git: bool,
     /// Propagate deletions (still never on the first run — an empty baseline).
     pub allow_delete: bool,
@@ -233,13 +234,16 @@ pub struct Outcome {
     pub errors: Vec<String>,
 }
 
-fn filter_direction(acts: Vec<Action>, dir: Direction) -> Vec<Action> {
+fn filter_direction(acts: Vec<Action>, dir: Direction, local: &Tree, remote: &Tree) -> Vec<Action> {
     match dir {
         Direction::Both => acts,
         Direction::PushOnly => acts
             .into_iter()
             .filter_map(|a| match a {
                 Action::Push(_) | Action::DelRemote(_) => Some(a),
+                Action::Pull(rel) | Action::DelLocal(rel) if local.contains_key(&rel) => {
+                    Some(Action::Push(rel))
+                }
                 Action::Pull(_) | Action::DelLocal(_) => None,
                 Action::Conflict { rel, .. } => Some(Action::Push(rel)),
             })
@@ -248,6 +252,9 @@ fn filter_direction(acts: Vec<Action>, dir: Direction) -> Vec<Action> {
             .into_iter()
             .filter_map(|a| match a {
                 Action::Pull(_) | Action::DelLocal(_) => Some(a),
+                Action::Push(rel) | Action::DelRemote(rel) if remote.contains_key(&rel) => {
+                    Some(Action::Pull(rel))
+                }
                 Action::Push(_) | Action::DelRemote(_) => None,
                 Action::Conflict { rel, .. } => Some(Action::Pull(rel)),
             })
@@ -322,9 +329,15 @@ pub fn reconcile(local: &Tree, remote: &Tree, base: &Tree, allow_delete: bool) -
 /// `opts.dry_run`). Returns the new baseline + a [`Report`]. `host` labels
 /// conflict copies.
 ///
-/// `base_remote`'s parent must exist; the sync root itself is created if missing
-/// on push-capable runs (like `rsync`/`scp`). [`Direction::PullOnly`] never
-/// creates it — a missing source is an error.
+/// `base_remote`'s parent must exist; the sync root may be created on an initial
+/// push-capable run. On subsequent runs a missing root is an error, not a
+/// deletion of every remote file. [`Direction::PullOnly`] never creates it.
+///
+/// Before each action, affected paths are checked again using size and
+/// whole-second mtime. This is not atomic: changes after the check, during a
+/// transfer, or changes with identical metadata can still be missed. The remote
+/// interface has no stat operation, so checks list each ancestor directory;
+/// many actions in one large directory can still be expensive.
 pub async fn sync_once<R: RemoteFs>(
     fs: &R,
     base_remote: &str,
@@ -334,13 +347,13 @@ pub async fn sync_once<R: RemoteFs>(
     host: &str,
 ) -> Result<Outcome, SyncError> {
     // Pull-only must not create a missing source and then read it as empty.
-    if !opts.dry_run && opts.direction != Direction::PullOnly {
+    if !opts.dry_run && opts.direction != Direction::PullOnly && baseline.is_empty() {
         fs.mkdir(base_remote).await?;
     }
     // Walking a large tree is the single biggest blocking chunk in the cycle;
     // offload it so it can't stall the runtime thread (and thus the co-located
     // transport keepalive) on a current-thread executor.
-    let (local, local_sym) = {
+    let (local, mut local_sym) = {
         let root = local_root.to_path_buf();
         let git = opts.git;
         tokio::task::spawn_blocking(move || scan_local_shadowed(&root, git))
@@ -348,8 +361,20 @@ pub async fn sync_once<R: RemoteFs>(
             .map_err(SyncError::backend)??
     };
     let (remote, remote_sym) = scan_remote_shadowed(fs, base_remote).await?;
+    if opts.git {
+        for path in remote.keys().chain(baseline.keys()) {
+            if !local.contains_key(path) && ignored_absent_path(local_root, path)? {
+                local_sym.insert(path.clone());
+            }
+        }
+    }
     let allow = opts.allow_delete && !baseline.is_empty(); // first run never deletes
-    let mut acts = filter_direction(reconcile(&local, &remote, baseline, allow), opts.direction);
+    let mut acts = filter_direction(
+        reconcile(&local, &remote, baseline, allow),
+        opts.direction,
+        &local,
+        &remote,
+    );
     // A symlink also shadows all paths beneath it.
     acts.retain(|a| match a {
         Action::Push(rel)
@@ -372,6 +397,12 @@ pub async fn sync_once<R: RemoteFs>(
     }
     // Advance only successful actions to avoid treating failed transfers as deletions.
     let mut new_base = baseline.clone();
+    new_base.retain(|path, _| {
+        local.contains_key(path)
+            || remote.contains_key(path)
+            || is_shadowed(path, &local_sym)
+            || is_shadowed(path, &remote_sym)
+    });
     for (path, meta) in &local {
         if remote.get(path) == Some(meta) {
             new_base.insert(path.clone(), *meta);
@@ -380,7 +411,32 @@ pub async fn sync_once<R: RemoteFs>(
     let mut changed = 0usize;
     let mut errors = Vec::new();
     for a in &acts {
-        match apply(fs, base_remote, local_root, a, host, &remote).await {
+        let rel = match a {
+            Action::Push(rel)
+            | Action::Pull(rel)
+            | Action::DelRemote(rel)
+            | Action::DelLocal(rel)
+            | Action::Conflict { rel, .. } => rel,
+        };
+        // Best-effort validation only: neither backend exposes conditional
+        // mutation, and metadata is only second-resolution mtime plus size.
+        let validation = async {
+            let current_local = local_path_meta(local_root, rel)?;
+            let current_remote = remote_path_meta(fs, base_remote, rel).await?;
+            if (opts.git && ignored_absent_path(local_root, rel)?)
+                || current_local.as_ref() != local.get(rel)
+                || current_remote.as_ref() != remote.get(rel)
+            {
+                return Err(SyncError::backend("path changed since scan; retry sync"));
+            }
+            Ok(())
+        }
+        .await;
+        let result = match validation {
+            Ok(()) => apply(fs, base_remote, local_root, a, host, &remote).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(()) => {
                 commit_baseline(&mut new_base, a, &local, &remote);
                 changed += 1;
@@ -401,6 +457,177 @@ fn is_shadowed(path: &str, symlinks: &BTreeSet<String>) -> bool {
         || path
             .match_indices('/')
             .any(|(i, _)| symlinks.contains(&path[..i]))
+}
+
+// These checks reduce the scan-to-action window, but are not conditional
+// filesystem operations. Same-size edits within one timestamp second and
+// changes after validation (including during transfer) remain undetectable.
+fn local_path_meta(root: &Path, rel: &str) -> Result<Option<Meta>, SyncError> {
+    let mut path = root.to_path_buf();
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        path.push(part);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(SyncError::backend("local path became a symlink"));
+        }
+        if parts.peek().is_some() {
+            if !meta.is_dir() {
+                return Err(SyncError::backend("local parent is not a directory"));
+            }
+        } else if meta.is_file() {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            return Ok(Some(Meta {
+                mtime,
+                size: meta.len(),
+            }));
+        } else {
+            return Err(SyncError::backend("local path is not a regular file"));
+        }
+    }
+    Ok(None)
+}
+
+async fn remote_path_meta<R: RemoteFs>(
+    fs: &R,
+    base: &str,
+    rel: &str,
+) -> Result<Option<Meta>, SyncError> {
+    let mut dir = base.to_string();
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let entries = fs.read_dir(&dir).await?;
+        let Some(entry) = entries.into_iter().find(|e| e.name == part) else {
+            return Ok(None);
+        };
+        if entry.is_symlink {
+            return Err(SyncError::backend("remote path became a symlink"));
+        }
+        if parts.peek().is_some() {
+            if !entry.is_dir {
+                return Err(SyncError::backend("remote parent is not a directory"));
+            }
+            dir = join(&dir, part);
+        } else if !entry.is_dir {
+            return Ok(Some(Meta {
+                mtime: entry.mtime,
+                size: entry.size,
+            }));
+        } else {
+            return Err(SyncError::backend("remote path is a directory"));
+        }
+    }
+    Ok(None)
+}
+
+// Match each component top-down: an ignored parent cannot be re-included by
+// a rule in a directory that the walker would never enter. Rules in .ignore
+// have priority over git rules, as in ignore::WalkBuilder.
+fn ignored_absent_path(root: &Path, rel: &str) -> Result<bool, SyncError> {
+    use ignore::gitignore::{Gitignore, GitignoreBuilder};
+    let root = std::fs::canonicalize(root)?;
+    let repo = root
+        .ancestors()
+        .find(|p| p.join(".git").exists())
+        .map(Path::to_path_buf);
+    let mut ignores = Vec::new();
+    let mut gitignores = Vec::new();
+    let load = |dir: &Path, name: &str| -> Result<Gitignore, SyncError> {
+        let path = dir.join(name);
+        let mut b = GitignoreBuilder::new(dir);
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                if let Some(e) = b.add(&path) {
+                    return Err(SyncError::backend(e));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        b.build().map_err(SyncError::backend)
+    };
+    let mut ancestors: Vec<_> = root.ancestors().map(Path::to_path_buf).collect();
+    ancestors.reverse();
+    for dir in &ancestors {
+        ignores.push(load(dir, ".ignore")?);
+        if repo.as_ref().is_some_and(|r| dir.starts_with(r)) {
+            gitignores.push(load(dir, ".gitignore")?);
+        }
+    }
+    let (global, exclude) = if let Some(repo) = &repo {
+        let (global, error) = GitignoreBuilder::new(repo).build_global();
+        if let Some(e) = error {
+            return Err(SyncError::backend(e));
+        }
+        let dotgit = repo.join(".git");
+        let gitdir = if dotgit.is_dir() {
+            dotgit
+        } else {
+            let text = std::fs::read_to_string(&dotgit)?;
+            let path = text
+                .trim()
+                .strip_prefix("gitdir: ")
+                .ok_or_else(|| SyncError::backend("invalid .git file"))?;
+            repo.join(path)
+        };
+        let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+            Ok(path) => gitdir.join(path.trim()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => gitdir,
+            Err(e) => return Err(e.into()),
+        };
+        let exclude_path = common.join("info/exclude");
+        let mut builder = GitignoreBuilder::new(repo);
+        match std::fs::metadata(&exclude_path) {
+            Ok(_) => {
+                if let Some(e) = builder.add(&exclude_path) {
+                    return Err(SyncError::backend(e));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        (global, builder.build().map_err(SyncError::backend)?)
+    } else {
+        (Gitignore::empty(), Gitignore::empty())
+    };
+    let mut path = root.clone();
+    let mut parts = rel.split('/').peekable();
+    while let Some(part) = parts.next() {
+        path.push(part);
+        let is_dir = parts.peek().is_some();
+        let mut result = None;
+        for matcher in ignores
+            .iter()
+            .rev()
+            .chain(gitignores.iter().rev())
+            .chain([&exclude, &global])
+        {
+            let m = matcher.matched(&path, is_dir);
+            if !m.is_none() {
+                result = Some(m.is_ignore());
+                break;
+            }
+        }
+        if result == Some(true) {
+            return Ok(true);
+        }
+        if is_dir {
+            ignores.push(load(&path, ".ignore")?);
+            if repo.is_some() {
+                gitignores.push(load(&path, ".gitignore")?);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Fold one successfully-applied action into the running baseline, deriving the
@@ -444,7 +671,7 @@ async fn apply<R: RemoteFs>(
     let rmtime = |rel: &str| remote.get(rel).map(|m| m.mtime).unwrap_or(0);
     match a {
         Action::Push(rel) => push(fs, base, local_root, rel, remote.contains_key(rel)).await,
-        Action::Pull(rel) => pull(fs, base, local_root, rel, rel, rmtime(rel)).await,
+        Action::Pull(rel) => pull(fs, base, local_root, rel, rel, rmtime(rel), false).await,
         Action::DelRemote(rel) => fs.remove_file(&join(base, rel)).await,
         Action::DelLocal(rel) => {
             std::fs::remove_file(local_root.join(rel)).map_err(SyncError::from)
@@ -454,13 +681,24 @@ async fn apply<R: RemoteFs>(
             // second would otherwise share a tag and clobber the first aside-copy.
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Host labels are untrusted and must never add path components.
+            let host: String = host
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
             let tag = format!("{rel}.conflict-{host}-{}-{n}", now_secs());
             if *local_newer {
-                pull(fs, base, local_root, rel, &tag, rmtime(rel)).await?; // save remote aside
+                pull(fs, base, local_root, rel, &tag, rmtime(rel), true).await?; // save remote aside
                 push(fs, base, local_root, rel, remote.contains_key(rel)).await // local wins
             } else {
                 copy_local(local_root, rel, &tag)?; // save local aside
-                pull(fs, base, local_root, rel, rel, rmtime(rel)).await // remote wins
+                pull(fs, base, local_root, rel, rel, rmtime(rel), false).await // remote wins
             }
         }
     }
@@ -489,7 +727,7 @@ async fn push<R: RemoteFs>(
         tokio::io::copy(&mut lf, &mut w).await?;
         w.shutdown().await?; // flush + close (adapter awaits SFTP CLOSE)
         drop(w);
-        let _ = fs.set_mtime(&tmp, mtime).await;
+        fs.set_mtime(&tmp, mtime).await?;
         if destination_exists {
             fs.rename(&rpath, &backup).await?;
         }
@@ -521,6 +759,7 @@ async fn pull<R: RemoteFs>(
     src_rel: &str,
     dst_rel: &str,
     mtime: i64,
+    exclusive: bool,
 ) -> Result<(), SyncError> {
     let rpath = join(base, src_rel);
     let lpath = local_root.join(dst_rel);
@@ -556,15 +795,29 @@ async fn pull<R: RemoteFs>(
     tokio::io::copy(&mut r, &mut lf).await?;
     lf.flush().await?;
     drop(lf);
-    set_local_mtime(&tmp, mtime);
-    std::fs::rename(&tmp, &lpath)?;
+    set_local_mtime(&tmp, mtime)?;
+    if exclusive {
+        // Publish without replacing an existing conflict copy or symlink.
+        std::fs::hard_link(&tmp, &lpath)?;
+    } else {
+        std::fs::rename(&tmp, &lpath)?;
+    }
     Ok(())
 }
 
 fn copy_local(local_root: &Path, rel: &str, dst_rel: &str) -> Result<(), SyncError> {
-    std::fs::copy(local_root.join(rel), local_root.join(dst_rel))
-        .map(|_| ())
-        .map_err(SyncError::from)
+    let mut source = std::fs::File::open(local_root.join(rel))?;
+    let dest = local_root.join(dst_rel);
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)?;
+    let result = std::io::copy(&mut source, &mut target);
+    drop(target);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result.map(|_| ()).map_err(SyncError::from)
 }
 
 async fn ensure_remote_dirs<R: RemoteFs>(fs: &R, base: &str, rel: &str) -> Result<(), SyncError> {
@@ -594,6 +847,7 @@ pub fn scan_local(root: &Path, git: bool) -> Result<Tree, SyncError> {
 fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>), SyncError> {
     let mut out = Tree::new();
     let mut shadow = BTreeSet::new();
+    let mut visible = BTreeSet::new();
     let walker = ignore::WalkBuilder::new(root)
         .standard_filters(git)
         .hidden(false)
@@ -612,7 +866,10 @@ fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>
         let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
-        let Some(rel) = rel.to_str() else { continue };
+        let rel = rel.to_str().ok_or_else(|| {
+            SyncError::backend(format!("non-UTF-8 local path: {}", entry.path().display()))
+        })?;
+        visible.insert(rel.to_owned());
         if is_skippable(rel) {
             continue;
         }
@@ -638,6 +895,26 @@ fn scan_local_shadowed(root: &Path, git: bool) -> Result<(Tree, BTreeSet<String>
                 size: m.len(),
             },
         );
+    }
+    if git {
+        // The filtered walk omits ignored files and whole directories. Record
+        // those omissions as shadows rather than interpreting them as deletes.
+        for entry in ignore::WalkBuilder::new(root)
+            .standard_filters(false)
+            .build()
+        {
+            let entry = entry.map_err(SyncError::backend)?;
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(SyncError::backend)?;
+            let rel = rel.to_str().ok_or_else(|| {
+                SyncError::backend(format!("non-UTF-8 local path: {}", entry.path().display()))
+            })?;
+            if !visible.contains(rel) {
+                shadow.insert(rel.replace('\\', "/"));
+            }
+        }
     }
     Ok((out, shadow))
 }
@@ -797,23 +1074,34 @@ fn local_mtime_secs(p: &Path) -> i64 {
 }
 
 #[cfg(unix)]
-fn set_local_mtime(p: &Path, secs: i64) {
+fn set_local_mtime(p: &Path, secs: i64) -> Result<(), SyncError> {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
-        return;
-    };
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(SyncError::backend)?;
     let t = libc::timespec {
         tv_sec: secs as libc::time_t,
         tv_nsec: 0,
     };
     let times = [t, t];
-    unsafe {
-        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_local_mtime(_p: &Path, _secs: i64) {}
+fn set_local_mtime(p: &Path, secs: i64) -> Result<(), SyncError> {
+    let time = if secs >= 0 {
+        UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(secs.unsigned_abs()))
+    }
+    .ok_or_else(|| SyncError::backend("mtime is outside the supported range"))?;
+    std::fs::File::options()
+        .write(true)
+        .open(p)?
+        .set_times(std::fs::FileTimes::new().set_modified(time))?;
+    Ok(())
+}
 
 fn config_dir() -> std::path::PathBuf {
     #[cfg(target_os = "macos")]
@@ -851,6 +1139,23 @@ mod tests {
     }
 
     #[test]
+    fn conflict_copy_does_not_replace_existing_file() {
+        let root =
+            std::env::temp_dir().join(format!("sftp-sync-conflict-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("source"), "source").unwrap();
+        std::fs::write(root.join("conflict"), "existing").unwrap();
+        assert!(copy_local(&root, "source", "conflict").is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("conflict")).unwrap(),
+            "existing"
+        );
+        std::fs::remove_file(root.join("source")).unwrap();
+        std::fs::remove_file(root.join("conflict")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn first_run_unions_never_deletes() {
         let local = t(&[("a", m(1, 1))]);
         let remote = t(&[("b", m(1, 1))]);
@@ -868,6 +1173,54 @@ mod tests {
     fn in_sync_pair_is_noop() {
         let both = t(&[("a", m(5, 10))]);
         assert!(reconcile(&both, &both, &both, true).is_empty());
+    }
+
+    #[test]
+    fn one_way_replaces_changed_non_authoritative_file() {
+        let base = t(&[("a", m(1, 1))]);
+        let edited = t(&[("a", m(2, 2))]);
+        assert_eq!(
+            filter_direction(
+                reconcile(&base, &edited, &base, true),
+                Direction::PushOnly,
+                &base,
+                &edited
+            ),
+            vec![Action::Push("a".into())]
+        );
+        assert_eq!(
+            filter_direction(
+                reconcile(&edited, &base, &base, true),
+                Direction::PullOnly,
+                &edited,
+                &base
+            ),
+            vec![Action::Pull("a".into())]
+        );
+    }
+
+    #[test]
+    fn one_way_restores_deleted_non_authoritative_file() {
+        let base = t(&[("a", m(1, 1))]);
+        let empty = Tree::new();
+        assert_eq!(
+            filter_direction(
+                reconcile(&base, &empty, &base, true),
+                Direction::PushOnly,
+                &base,
+                &empty
+            ),
+            vec![Action::Push("a".into())]
+        );
+        assert_eq!(
+            filter_direction(
+                reconcile(&empty, &base, &base, true),
+                Direction::PullOnly,
+                &empty,
+                &base
+            ),
+            vec![Action::Pull("a".into())]
+        );
     }
 
     #[test]

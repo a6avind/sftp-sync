@@ -231,8 +231,9 @@ impl FileAttributes {
         if flags & ATTR_EXTENDED != 0 {
             let n = cur.u32()?;
             for _ in 0..n {
-                cur.string()?;
-                cur.string()?;
+                // Ignored extension fields are opaque wire strings.
+                cur.bytes()?;
+                cur.bytes()?;
             }
         }
         Ok(a)
@@ -335,7 +336,8 @@ pub struct Status {
 
 pub struct Handle {
     pub id: u32,
-    pub handle: String,
+    /// Opaque handle bytes, not necessarily UTF-8.
+    pub handle: Vec<u8>,
 }
 
 pub struct Data {

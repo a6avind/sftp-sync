@@ -11,11 +11,38 @@ use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::proto::client::SftpSession;
-use crate::proto::protocol::{FileAttributes, OpenFlags};
+use crate::proto::protocol::{FileAttributes, FileType, OpenFlags};
 use crate::{RemoteEntry, RemoteFs, SyncError};
 
 fn be(e: impl std::fmt::Display) -> SyncError {
     SyncError::backend(e)
+}
+
+fn remote_entry(name: String, m: FileAttributes, ft: FileType) -> Result<RemoteEntry, SyncError> {
+    if ft.is_other() {
+        return Err(be(format!("unrecognized file type for {name:?}")));
+    }
+    let (mtime, size) = if ft.is_dir() || ft.is_symlink() {
+        (m.mtime.unwrap_or(0), m.size.unwrap_or(0))
+    } else {
+        (
+            m.mtime
+                .ok_or_else(|| be(format!("missing mtime for {name:?}")))?,
+            m.size
+                .ok_or_else(|| be(format!("missing size for {name:?}")))?,
+        )
+    };
+    Ok(RemoteEntry {
+        is_dir: ft.is_dir(),
+        is_symlink: ft.is_symlink(),
+        mtime: i64::from(mtime),
+        size,
+        name,
+    })
+}
+
+fn sftp_mtime(mtime: i64) -> Result<u32, SyncError> {
+    u32::try_from(mtime).map_err(|_| be("mtime is outside the SFTP v3 timestamp range"))
 }
 
 pub enum Auth {
@@ -127,13 +154,7 @@ impl RemoteFs for SftpFs {
             // Type via the DirEntry (longname fallback) not the attrs alone, so a
             // server that omits PERMISSIONS doesn't get every subdir misread as a file.
             let ft = e.file_type();
-            out.push(RemoteEntry {
-                is_dir: ft.is_dir(),
-                is_symlink: ft.is_symlink(),
-                mtime: m.mtime.unwrap_or(0) as i64,
-                size: m.size.unwrap_or(0),
-                name,
-            });
+            out.push(remote_entry(name, m, ft)?);
         }
         Ok(out)
     }
@@ -163,9 +184,8 @@ impl RemoteFs for SftpFs {
     }
 
     async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
-        // atime+mtime travel as one unit; set both so a one-sided write never
-        // zeroes atime to 1970. Clamp pre-epoch to 0, else `as u32` wraps it to 2106.
-        let secs = mtime.max(0) as u32;
+        // SFTP v3 sends atime and mtime together.
+        let secs = sftp_mtime(mtime)?;
         let mut attrs = FileAttributes::empty();
         attrs.atime = Some(secs);
         attrs.mtime = Some(secs);
@@ -210,17 +230,82 @@ impl SftpFs {
     pub async fn remote_sha256(&self, path: &str) -> Result<Option<[u8; 32]>, SyncError> {
         use crate::proto::client::error::Error as E;
         match self.sftp.check_file(path, "sha256", 0, 0, 0).await {
-            Ok(cf) if cf.hashes.len() >= 32 => {
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&cf.hashes[..32]);
-                Ok(Some(out))
-            }
-            Ok(cf) => Err(SyncError::backend(format!(
-                "check-file returned {} hash bytes, expected >= 32",
-                cf.hashes.len()
-            ))),
+            Ok(cf) => validate_sha256(cf).map(Some),
             Err(E::Unsupported(_)) => Ok(None),
             Err(e) => Err(SyncError::backend(e)),
         }
+    }
+}
+
+#[cfg(feature = "check-file")]
+fn validate_sha256(cf: crate::proto::protocol::CheckFile) -> Result<[u8; 32], SyncError> {
+    if cf.hash_algorithm != "sha256" {
+        return Err(be(format!(
+            "check-file returned unexpected algorithm {:?}, expected sha256",
+            cf.hash_algorithm
+        )));
+    }
+    let len = cf.hashes.len();
+    cf.hashes
+        .try_into()
+        .map_err(|_| be(format!("check-file returned {len} hash bytes, expected 32")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_requires_known_type_and_metadata() {
+        let attrs = FileAttributes {
+            mtime: Some(0),
+            size: Some(0),
+            ..FileAttributes::empty()
+        };
+        assert!(remote_entry("file".into(), attrs, FileType::File).is_ok());
+        assert!(remote_entry("file".into(), attrs, FileType::Other).is_err());
+        assert!(
+            remote_entry(
+                "file".into(),
+                FileAttributes {
+                    mtime: None,
+                    ..attrs
+                },
+                FileType::File
+            )
+            .is_err()
+        );
+        assert!(
+            remote_entry(
+                "file".into(),
+                FileAttributes {
+                    size: None,
+                    ..attrs
+                },
+                FileType::File
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mtime_rejects_values_outside_wire_range() {
+        assert!(sftp_mtime(-1).is_err());
+        assert_eq!(sftp_mtime(42).unwrap(), 42);
+        assert!(sftp_mtime(i64::MAX).is_err());
+    }
+
+    #[cfg(feature = "check-file")]
+    #[test]
+    fn sha256_requires_exact_algorithm_and_length() {
+        use crate::proto::protocol::CheckFile;
+        let check = |algorithm: &str, len| CheckFile {
+            hash_algorithm: algorithm.into(),
+            hashes: vec![7; len],
+        };
+        assert_eq!(validate_sha256(check("sha256", 32)).unwrap(), [7; 32]);
+        assert!(validate_sha256(check("sha1", 32)).is_err());
+        assert!(validate_sha256(check("sha256", 31)).is_err());
+        assert!(validate_sha256(check("sha256", 33)).is_err());
     }
 }

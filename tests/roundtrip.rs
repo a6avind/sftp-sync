@@ -13,6 +13,78 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 struct LocalFs;
 
+struct CountingFs {
+    unrelated_reads: AtomicU32,
+}
+
+impl RemoteFs for CountingFs {
+    async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
+        if path.ends_with("/unrelated") {
+            self.unrelated_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        LocalFs.read_dir(path).await
+    }
+    async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
+        LocalFs.open_read(path).await
+    }
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        LocalFs.create_new(path).await
+    }
+    async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
+        LocalFs.set_mtime(path, mtime).await
+    }
+    async fn remove_file(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.remove_file(path).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
+        LocalFs.rename(from, to).await
+    }
+    async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.mkdir(path).await
+    }
+}
+
+// Mutate after returning the first remote directory snapshot, i.e. after the
+// local scan and before the action's validation.
+struct ChangeAfterScan {
+    target: PathBuf,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl RemoteFs for ChangeAfterScan {
+    async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
+        let entries = LocalFs.read_dir(path).await?;
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            std::fs::write(&self.target, "concurrent change").unwrap();
+        }
+        Ok(entries)
+    }
+    async fn open_read(&self, path: &str) -> Result<Box<dyn AsyncRead + Send + Unpin>, SyncError> {
+        LocalFs.open_read(path).await
+    }
+    async fn create_new(
+        &self,
+        path: &str,
+    ) -> Result<Box<dyn AsyncWrite + Send + Unpin>, SyncError> {
+        LocalFs.create_new(path).await
+    }
+    async fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), SyncError> {
+        LocalFs.set_mtime(path, mtime).await
+    }
+    async fn remove_file(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.remove_file(path).await
+    }
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SyncError> {
+        LocalFs.rename(from, to).await
+    }
+    async fn mkdir(&self, path: &str) -> Result<(), SyncError> {
+        LocalFs.mkdir(path).await
+    }
+}
+
 impl RemoteFs for LocalFs {
     async fn read_dir(&self, path: &str) -> Result<Vec<RemoteEntry>, SyncError> {
         let mut out = Vec::new();
@@ -273,6 +345,27 @@ async fn matching_files_enter_baseline_and_deletions_propagate() {
 }
 
 #[tokio::test]
+async fn missing_established_remote_root_does_not_delete_local_files() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "precious", "keep", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    std::fs::remove_file(remote.join("precious")).unwrap();
+    std::fs::remove_dir(&remote).unwrap();
+    let result = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &first.baseline,
+        &Default::default(),
+        "h",
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!remote.exists());
+    assert_eq!(read(&local, "precious").as_deref(), Some("keep"));
+}
+
+#[tokio::test]
 async fn exclusive_remote_create_refuses_existing_symlinks() {
     let remote = tmpdir("r");
     let canary = remote.join("canary");
@@ -470,6 +563,41 @@ async fn push_only_ignores_remote_side() {
 }
 
 #[tokio::test]
+async fn one_way_restores_authoritative_version_after_destination_edit() {
+    for direction in [
+        sftp_sync::Direction::PushOnly,
+        sftp_sync::Direction::PullOnly,
+    ] {
+        let (local, remote) = (tmpdir("l"), tmpdir("r"));
+        put(&local, "file", "original", 1000);
+        let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+        let destination = if direction == sftp_sync::Direction::PushOnly {
+            &remote
+        } else {
+            &local
+        };
+        put(destination, "file", "edited", 2000);
+        let opts = sftp_sync::SyncOptions {
+            direction,
+            ..Default::default()
+        };
+        let out = sftp_sync::sync_once(
+            &LocalFs,
+            remote.to_str().unwrap(),
+            &local,
+            &first.baseline,
+            &opts,
+            "h",
+        )
+        .await
+        .unwrap();
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(read(destination, "file").as_deref(), Some("original"));
+        assert_eq!(out.changed, 1);
+    }
+}
+
+#[tokio::test]
 async fn failed_push_does_not_poison_baseline() {
     // Regression: a failed transfer must not be recorded as synced. If it were,
     // the next reconcile would read "local exists, remote doesn't" as a remote
@@ -662,4 +790,265 @@ async fn hostile_remote_names_cannot_escape_root() {
     .unwrap();
     assert!(!canary.exists(), "no write escaped the local root");
     assert!(local.join("ok.txt").exists(), "safe file pulled");
+}
+
+#[tokio::test]
+async fn newly_ignored_files_and_directories_do_not_delete_remote() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    std::fs::create_dir(local.join(".git")).unwrap();
+    put(&local, "file", "keep", 1000);
+    put(&local, "dir/nested", "keep too", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    put(&local, ".gitignore", "file\ndir/\n", 1000);
+    let opts = sftp_sync::SyncOptions {
+        git: true,
+        ..Default::default()
+    };
+    let out = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &first.baseline,
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.report.deleted_remote, 0);
+    assert_eq!(read(&remote, "file").as_deref(), Some("keep"));
+    assert_eq!(read(&remote, "dir/nested").as_deref(), Some("keep too"));
+    assert!(out.baseline.contains_key("dir/nested"));
+}
+
+#[tokio::test]
+async fn changed_after_scan_is_not_deleted_or_overwritten() {
+    for remote_deleted in [false, true] {
+        let (local, remote) = (tmpdir("race-l"), tmpdir("race-r"));
+        put(&local, "file", "old", 1000);
+        let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+        let (deleted, survivor) = if remote_deleted {
+            (&remote, &local)
+        } else {
+            (&local, &remote)
+        };
+        std::fs::remove_file(deleted.join("file")).unwrap();
+        let fs = ChangeAfterScan {
+            target: survivor.join("file"),
+            fired: false.into(),
+        };
+        let out = sftp_sync::sync_once(
+            &fs,
+            remote.to_str().unwrap(),
+            &local,
+            &first.baseline,
+            &Default::default(),
+            "h",
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(survivor, "file").as_deref(), Some("concurrent change"));
+        assert_eq!(out.changed, 0);
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(out.baseline, first.baseline);
+    }
+}
+
+#[tokio::test]
+async fn changed_after_scan_prevents_stale_transfer() {
+    for push in [false, true] {
+        let (local, remote) = (tmpdir("transfer-l"), tmpdir("transfer-r"));
+        put(&local, "file", "old", 1000);
+        let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+        let (source, destination) = if push {
+            (&local, &remote)
+        } else {
+            (&remote, &local)
+        };
+        put(source, "file", "planned update", 2000);
+        let fs = ChangeAfterScan {
+            target: destination.join("file"),
+            fired: false.into(),
+        };
+        let out = sftp_sync::sync_once(
+            &fs,
+            remote.to_str().unwrap(),
+            &local,
+            &first.baseline,
+            &Default::default(),
+            "h",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read(destination, "file").as_deref(),
+            Some("concurrent change")
+        );
+        assert_eq!(out.changed, 0);
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(out.baseline, first.baseline);
+    }
+}
+
+#[tokio::test]
+async fn git_mode_preserves_remote_only_ignored_paths() {
+    let (local, remote) = (tmpdir("git-l"), tmpdir("git-r"));
+    std::fs::create_dir(local.join(".git")).unwrap();
+    put(&local, ".gitignore", "*.log\ndir/\n", 1000);
+    put(&remote, "missing.log", "remote", 1000);
+    put(&remote, "dir/file", "remote nested", 1000);
+    let mut base = sftp_sync::Tree::new();
+    base.insert(
+        "missing.log".into(),
+        sftp_sync::Meta {
+            mtime: 1000,
+            size: 6,
+        },
+    );
+    let opts = sftp_sync::SyncOptions {
+        git: true,
+        ..Default::default()
+    };
+    let out = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &base,
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&remote, "missing.log").as_deref(), Some("remote"));
+    assert!(!local.join("dir/file").exists());
+    assert!(out.baseline.contains_key("missing.log"));
+}
+
+#[tokio::test]
+async fn git_mode_pulls_unignored_remote_only_paths_and_respects_negation() {
+    let (local, remote) = (tmpdir("git-pull-l"), tmpdir("git-pull-r"));
+    std::fs::create_dir(local.join(".git")).unwrap();
+    put(&local, ".gitignore", "*.log\n!important.log\n", 1000);
+    put(&local, "nested/.gitignore", "*.tmp\n!keep.tmp\n", 1000);
+    put(&remote, "normal.txt", "normal", 1000);
+    put(&remote, "important.log", "allowed", 1000);
+    put(&remote, "nested/keep.tmp", "nested allowed", 1000);
+    put(&remote, "nested/drop.tmp", "nested ignored", 1000);
+    let opts = sftp_sync::SyncOptions {
+        git: true,
+        ..Default::default()
+    };
+    let out = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &opts,
+        "h",
+    )
+    .await
+    .unwrap();
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_eq!(read(&local, "normal.txt").as_deref(), Some("normal"));
+    assert_eq!(read(&local, "important.log").as_deref(), Some("allowed"));
+    assert_eq!(
+        read(&local, "nested/keep.tmp").as_deref(),
+        Some("nested allowed")
+    );
+    assert!(!local.join("nested/drop.tmp").exists());
+}
+
+#[tokio::test]
+async fn validation_does_not_rescan_unrelated_subtrees() {
+    let (local, remote) = (tmpdir("bounded-l"), tmpdir("bounded-r"));
+    put(&remote, "unrelated/unchanged", "x", 1000);
+    put(&local, "unrelated/unchanged", "x", 1000);
+    for n in 0..12 {
+        put(&local, &format!("file{n}"), "x", 1000);
+    }
+    let fs = CountingFs {
+        unrelated_reads: AtomicU32::new(0),
+    };
+    let out = sftp_sync::sync_once(
+        &fs,
+        remote.to_str().unwrap(),
+        &local,
+        &sftp_sync::Tree::new(),
+        &Default::default(),
+        "h",
+    )
+    .await
+    .unwrap();
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_eq!(out.changed, 12);
+    assert_eq!(fs.unrelated_reads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn non_utf8_local_name_aborts_before_deletions() {
+    use std::os::unix::ffi::OsStringExt;
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "victim", "keep", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    std::fs::remove_file(local.join("victim")).unwrap();
+    std::fs::write(local.join(std::ffi::OsString::from_vec(vec![0xff])), "x").unwrap();
+    let result = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &first.baseline,
+        &Default::default(),
+        "h",
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(read(&remote, "victim").as_deref(), Some("keep"));
+}
+
+#[tokio::test]
+async fn absent_baseline_entries_are_pruned_except_shadowed_descendants() {
+    let (local, remote, outside) = (tmpdir("l"), tmpdir("r"), tmpdir("outside"));
+    put(&local, "gone", "old", 1000);
+    put(&local, "dir/file", "old", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    std::fs::remove_file(local.join("gone")).unwrap();
+    std::fs::remove_file(remote.join("gone")).unwrap();
+    std::fs::remove_file(local.join("dir/file")).unwrap();
+    std::fs::remove_dir(local.join("dir")).unwrap();
+    std::fs::remove_file(remote.join("dir/file")).unwrap();
+    std::os::unix::fs::symlink(&outside, local.join("dir")).unwrap();
+    let second = sync(&remote, &local, &first.baseline, true).await;
+    assert!(!second.baseline.contains_key("gone"));
+    assert!(second.baseline.contains_key("dir/file"));
+    put(&local, "gone", "old", 1000);
+    let third = sync(&remote, &local, &second.baseline, true).await;
+    assert_eq!(read(&remote, "gone").as_deref(), Some("old"));
+    assert!(third.errors.is_empty());
+}
+
+#[tokio::test]
+async fn conflict_host_cannot_add_path_components() {
+    let (local, remote) = (tmpdir("l"), tmpdir("r"));
+    put(&local, "a", "base", 1000);
+    let first = sync(&remote, &local, &sftp_sync::Tree::new(), true).await;
+    put(&local, "a", "local", 3000);
+    put(&remote, "a", "remote", 2000);
+    let out = sftp_sync::sync_once(
+        &LocalFs,
+        remote.to_str().unwrap(),
+        &local,
+        &first.baseline,
+        &Default::default(),
+        "../../escape",
+    )
+    .await
+    .unwrap();
+    assert!(out.errors.is_empty());
+    assert_eq!(out.report.conflicts, 1);
+    assert_eq!(read(&remote, "a").as_deref(), Some("local"));
+    assert!(std::fs::read_dir(&local).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".conflict-")
+    }));
 }

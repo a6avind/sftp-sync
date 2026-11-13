@@ -65,7 +65,7 @@ handler-driven in-process server (`server::run` + the `server::Handler` trait),
 useful for tests or loopback. `SftpFs` is the sync-focused wrapper over it.
 
 ```toml
-sftp-sync = { version = "0.3", features = ["sftp"] }
+sftp-sync = { version = "0.4", features = ["sftp"] }
 ```
 
 ```rust
@@ -129,9 +129,11 @@ with the new baseline, planned action counts, and per-action errors.
 
 - `git = true` honours `.gitignore` (and global/exclude) on the local walk.
 - Symlinks are skipped; directories are implicit.
-- Local mtime is set via `utimensat` (unix); a no-op elsewhere.
+- Transfers require successful timestamp preservation before publication.
 - Files are compared by size and whole-second mtime, not content hashes; changes
   that preserve both can be missed. Sync is not a replacement for backups.
+- Revalidation reduces, but cannot eliminate, races with files changed during a
+  sync. Avoid concurrent edits when strong consistency is required.
 - Only one sync process should operate on a given pair of trees at a time.
 - A leftover remote `.sync-backup.sync-tmp` stops sync for manual recovery.
 - Backend-agnostic core: no network deps unless you enable the `sftp` feature.

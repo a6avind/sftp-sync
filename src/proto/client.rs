@@ -3,10 +3,9 @@
 //! to its request by id; requests serialize writes behind a mutex.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
-use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 
@@ -57,7 +56,7 @@ pub mod error {
 /// A parsed server response, routed to a waiting request by id.
 enum Reply {
     Status(Status),
-    Handle(String),
+    Handle(Vec<u8>),
     Data(Vec<u8>),
     Name(Vec<NameFile>),
     Attrs(FileAttributes),
@@ -66,9 +65,42 @@ enum Reply {
 
 struct Inner {
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
-    pending: DashMap<u32, oneshot::Sender<Reply>>,
+    pending: StdMutex<Pending>,
     next_id: AtomicU32,
     extensions: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct Pending {
+    closed: bool,
+    requests: HashMap<u32, oneshot::Sender<Reply>>,
+}
+
+// Removing a waiter on cancellation also prevents abandoned requests from
+// accumulating indefinitely when the server never answers.
+struct RequestGuard {
+    inner: Arc<Inner>,
+    id: u32,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.inner.pending.lock().unwrap().requests.remove(&self.id);
+    }
+}
+
+// Once a frame starts writing, cancellation or an error can leave an unknown
+// prefix on the wire. Never permit another request to append to that stream.
+struct WriteGuard(Arc<Inner>, bool);
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            let mut pending = self.0.pending.lock().unwrap();
+            pending.closed = true;
+            pending.requests.clear();
+        }
+    }
 }
 
 /// An SFTP v3 client session. Cheap to clone (shared inner state).
@@ -95,7 +127,10 @@ impl SftpSession {
         if cur.u8().map_err(|_| proto_err("short VERSION"))? != fxp::VERSION {
             return Err(proto_err("expected VERSION"));
         }
-        let _server_version = cur.u32().map_err(|_| proto_err("short VERSION"))?;
+        let server_version = cur.u32().map_err(|_| proto_err("short VERSION"))?;
+        if server_version != SFTP_VERSION {
+            return Err(proto_err("unsupported SFTP version"));
+        }
         let mut extensions = HashMap::new();
         while cur.remaining() > 0 {
             let name = cur.string().map_err(|_| proto_err("bad extension"))?;
@@ -105,7 +140,7 @@ impl SftpSession {
 
         let inner = Arc::new(Inner {
             writer: Mutex::new(Box::new(wr)),
-            pending: DashMap::new(),
+            pending: StdMutex::new(Pending::default()),
             next_id: AtomicU32::new(1),
             extensions,
         });
@@ -121,14 +156,49 @@ impl SftpSession {
     }
 
     async fn request(&self, id: u32, body: Vec<u8>) -> SftpResult<Reply> {
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.insert(id, tx);
+        let (tx, mut rx) = oneshot::channel();
         {
-            let mut w = self.inner.writer.lock().await;
-            if let Err(e) = w.write_all(&frame(&body)).await.and(w.flush().await) {
-                self.inner.pending.remove(&id);
-                return Err(Error::Io(e));
+            let mut pending = self.inner.pending.lock().unwrap();
+            if pending.closed {
+                return Err(Error::ConnectionLost);
             }
+            pending.requests.insert(id, tx);
+        }
+        let _request_guard = RequestGuard {
+            inner: self.inner.clone(),
+            id,
+        };
+        let write = async {
+            let mut w = self.inner.writer.lock().await;
+            if self.inner.pending.lock().unwrap().closed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "sftp channel closed",
+                ));
+            }
+            let mut guard = WriteGuard(self.inner.clone(), true);
+            w.write_all(&frame(&body)).await?;
+            w.flush().await?;
+            guard.1 = false;
+            Ok(())
+        };
+        tokio::pin!(write);
+        let result = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            use std::task::Poll;
+
+            if let Poll::Ready(reply) = std::pin::Pin::new(&mut rx).poll(cx) {
+                return Poll::Ready(Some(reply.map_err(|_| Error::ConnectionLost)));
+            }
+            match write.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(None),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Error::Io(e)))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await;
+        if let Some(result) = result {
+            return result;
         }
         rx.await.map_err(|_| Error::ConnectionLost)
     }
@@ -141,7 +211,7 @@ impl SftpSession {
         }
     }
 
-    async fn expect_handle(&self, id: u32, body: Vec<u8>) -> SftpResult<String> {
+    async fn expect_handle(&self, id: u32, body: Vec<u8>) -> SftpResult<Vec<u8>> {
         match self.request(id, body).await? {
             Reply::Handle(h) => Ok(h),
             Reply::Status(s) => Err(Error::Status(s)),
@@ -165,7 +235,7 @@ impl SftpSession {
         }
     }
 
-    async fn open_handle(&self, path: &str, flags: OpenFlags) -> SftpResult<String> {
+    async fn open_handle(&self, path: &str, flags: OpenFlags) -> SftpResult<Vec<u8>> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::OPEN, id);
         b.string(path);
@@ -190,10 +260,10 @@ impl SftpSession {
         Ok(fs::File::new(self.clone(), handle))
     }
 
-    async fn read_at(&self, handle: &str, offset: u64, len: u32) -> SftpResult<Vec<u8>> {
+    async fn read_at(&self, handle: &[u8], offset: u64, len: u32) -> SftpResult<Vec<u8>> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::READ, id);
-        b.string(handle);
+        b.bytes(handle);
         b.u64(offset);
         b.u32(len);
         match self.request(id, b.0).await? {
@@ -204,24 +274,26 @@ impl SftpSession {
         }
     }
 
-    async fn write_at(&self, handle: &str, offset: u64, data: &[u8]) -> SftpResult<()> {
+    async fn write_at(&self, handle: &[u8], offset: u64, data: &[u8]) -> SftpResult<()> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::WRITE, id);
-        b.string(handle);
+        b.bytes(handle);
         b.u64(offset);
         b.bytes(data);
         self.expect_status(id, b.0).await
     }
 
-    async fn close(&self, handle: &str) -> SftpResult<()> {
+    async fn close(&self, handle: &[u8]) -> SftpResult<()> {
         let id = self.next_id();
         let mut b = PacketBuf::request(fxp::CLOSE, id);
-        b.string(handle);
+        b.bytes(handle);
         self.expect_status(id, b.0).await
     }
 
     /// List a directory; each [`DirEntry`] carries its parent for [`DirEntry::path`].
     pub async fn read_dir(&self, path: &str) -> SftpResult<ReadDir> {
+        const MAX_ENTRIES: usize = 1_000_000;
+        const MAX_NAME_BYTES: usize = 64 * 1024 * 1024;
         let handle = {
             let id = self.next_id();
             let mut b = PacketBuf::request(fxp::OPENDIR, id);
@@ -230,12 +302,28 @@ impl SftpSession {
         };
 
         let mut entries = Vec::new();
+        let mut name_bytes = 0usize;
         loop {
             let id = self.next_id();
             let mut b = PacketBuf::request(fxp::READDIR, id);
-            b.string(&handle);
+            b.bytes(&handle);
             match self.request(id, b.0).await {
-                Ok(Reply::Name(mut names)) => entries.append(&mut names),
+                Ok(Reply::Name(mut names)) => {
+                    let batch_bytes = names.iter().try_fold(0usize, |sum, name| {
+                        sum.checked_add(name.filename.len())?
+                            .checked_add(name.longname.len())
+                    });
+                    let total = batch_bytes.and_then(|bytes| name_bytes.checked_add(bytes));
+                    if names.is_empty()
+                        || entries.len().saturating_add(names.len()) > MAX_ENTRIES
+                        || total.is_none_or(|size| size > MAX_NAME_BYTES)
+                    {
+                        let _ = self.close(&handle).await;
+                        return Err(proto_err("invalid or oversized directory listing"));
+                    }
+                    name_bytes = total.unwrap();
+                    entries.append(&mut names);
+                }
                 Ok(Reply::Status(s)) if s.status_code == StatusCode::Eof => break,
                 Ok(Reply::Status(s)) => {
                     let _ = self.close(&handle).await;
@@ -410,9 +498,10 @@ async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, inner: Arc<Inner>) {
         // error rather than hanging it until the connection drops.
         let mut head = Cursor::new(&body);
         let (Ok(_ty), Ok(id)) = (head.u8(), head.u32()) else {
-            continue;
+            break;
         };
-        if let Some((_, tx)) = inner.pending.remove(&id) {
+        let tx = inner.pending.lock().unwrap().requests.remove(&id);
+        if let Some(tx) = tx {
             let reply = parse_reply(&body).map(|(_, r)| r).unwrap_or_else(|| {
                 Reply::Status(Status {
                     id,
@@ -424,7 +513,9 @@ async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, inner: Arc<Inner>) {
             let _ = tx.send(reply);
         }
     }
-    inner.pending.clear(); // fail in-flight requests rather than hang
+    let mut pending = inner.pending.lock().unwrap();
+    pending.closed = true;
+    pending.requests.clear(); // fail in-flight requests rather than hang
 }
 
 fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
@@ -434,8 +525,8 @@ fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
     let reply = match ty {
         fxp::STATUS => {
             let code = cur.u32().ok()?;
-            let error_message = cur.string().unwrap_or_default();
-            let language_tag = cur.string().unwrap_or_default();
+            let error_message = cur.string().ok()?;
+            let language_tag = cur.string().ok()?;
             Reply::Status(Status {
                 id,
                 status_code: StatusCode::from_u32(code),
@@ -443,7 +534,7 @@ fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
                 language_tag,
             })
         }
-        fxp::HANDLE => Reply::Handle(cur.string().ok()?),
+        fxp::HANDLE => Reply::Handle(cur.bytes().ok()?),
         fxp::DATA => Reply::Data(cur.bytes().ok()?),
         fxp::ATTRS => Reply::Attrs(FileAttributes::decode(&mut cur).ok()?),
         fxp::EXTENDED_REPLY => Reply::Extended(cur.rest().to_vec()),
@@ -467,6 +558,112 @@ fn parse_reply(body: &[u8]) -> Option<(u32, Reply)> {
         _ => return None,
     };
     Some((id, reply))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inner() -> Arc<Inner> {
+        Arc::new(Inner {
+            writer: Mutex::new(Box::new(tokio::io::sink())),
+            pending: StdMutex::new(Pending::default()),
+            next_id: AtomicU32::new(1),
+            extensions: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn short_response_closes_reader_and_rejects_future_requests() {
+        let inner = inner();
+        let (tx, rx) = oneshot::channel();
+        inner.pending.lock().unwrap().requests.insert(1, tx);
+        let (reader, mut peer) = tokio::io::duplex(64);
+        let task = tokio::spawn(read_loop(reader, inner.clone()));
+        peer.write_all(&frame(&[fxp::STATUS, 0, 0])).await.unwrap();
+        task.await.unwrap();
+        assert!(rx.await.is_err());
+
+        let session = SftpSession { inner };
+        assert!(matches!(
+            session.request(2, vec![]).await,
+            Err(Error::ConnectionLost)
+        ));
+    }
+
+    #[tokio::test]
+    async fn eof_closes_reader_and_rejects_future_requests() {
+        let inner = inner();
+        let (reader, peer) = tokio::io::duplex(64);
+        drop(peer);
+        read_loop(reader, inner.clone()).await;
+        let session = SftpSession { inner };
+        assert!(matches!(
+            session.request(1, vec![]).await,
+            Err(Error::ConnectionLost)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_death_wakes_request_blocked_on_write() {
+        let (writer, _peer) = tokio::io::duplex(1);
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(Box::new(writer)),
+            pending: StdMutex::new(Pending::default()),
+            next_id: AtomicU32::new(1),
+            extensions: HashMap::new(),
+        });
+        let session = SftpSession {
+            inner: inner.clone(),
+        };
+        let request = tokio::spawn(async move { session.request(1, vec![0; 32]).await });
+        tokio::task::yield_now().await;
+        assert_eq!(inner.pending.lock().unwrap().requests.len(), 1);
+        let (reader, peer) = tokio::io::duplex(1);
+        drop(peer);
+        read_loop(reader, inner).await;
+        assert!(matches!(request.await.unwrap(), Err(Error::ConnectionLost)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_partial_frame_closes_session() {
+        let (writer, _peer) = tokio::io::duplex(1);
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(Box::new(writer)),
+            pending: StdMutex::new(Pending::default()),
+            next_id: AtomicU32::new(1),
+            extensions: HashMap::new(),
+        });
+        let session = SftpSession {
+            inner: inner.clone(),
+        };
+        let other = session.clone();
+        let task = tokio::spawn(async move { other.request(1, vec![0; 32]).await });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(inner.pending.lock().unwrap().requests.is_empty());
+        assert!(matches!(
+            session.request(2, vec![]).await,
+            Err(Error::ConnectionLost)
+        ));
+    }
+
+    #[test]
+    fn status_requires_both_complete_strings() {
+        let mut packet = PacketBuf::request(fxp::STATUS, 1);
+        packet.u32(0);
+        assert!(parse_reply(&packet.0).is_none());
+        packet.string("");
+        assert!(parse_reply(&packet.0).is_none());
+        packet.string("");
+        assert!(matches!(
+            parse_reply(&packet.0),
+            Some((1, Reply::Status(_)))
+        ));
+        packet.0.pop();
+        assert!(parse_reply(&packet.0).is_none());
+    }
 }
 
 /// One directory entry, carrying its parent so [`path`](DirEntry::path) can
@@ -518,25 +715,32 @@ pub mod fs {
 
     type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send>>;
 
+    enum Operation {
+        Read(IoFuture<Vec<u8>>, usize),
+        Write(IoFuture<()>, Vec<u8>),
+    }
+
     /// A remote file handle (`AsyncRead`/`AsyncWrite`/`AsyncSeek`). `shutdown`
     /// awaits an explicit CLOSE; dropping without it spawns a background CLOSE so
     /// the handle is never leaked.
     pub struct File {
         session: SftpSession,
-        handle: String,
+        handle: Vec<u8>,
         offset: u64,
         closed: bool,
-        op: Option<IoFuture<Vec<u8>>>,
+        closing: bool,
+        op: Option<Operation>,
         close_op: Option<IoFuture<()>>,
     }
 
     impl File {
-        pub(super) fn new(session: SftpSession, handle: String) -> Self {
+        pub(super) fn new(session: SftpSession, handle: Vec<u8>) -> Self {
             File {
                 session,
                 handle,
                 offset: 0,
                 closed: false,
+                closing: false,
                 op: None,
                 close_op: None,
             }
@@ -549,12 +753,42 @@ pub mod fs {
         /// CLOSE (and skips it entirely when no runtime is current), so open
         /// handles can outpace retirement and trip the server's open-handle limit.
         pub async fn close(mut self) -> io::Result<()> {
-            if self.closed {
-                return Ok(());
+            tokio::io::AsyncWriteExt::shutdown(&mut self).await
+        }
+
+        // Finish an abandoned operation before changing direction or closing.
+        // A completed read has not been delivered, so it does not advance offset.
+        fn poll_abandoned(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let result = match self.op.as_mut() {
+                None => return Poll::Ready(Ok(())),
+                Some(Operation::Read(fut, _)) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map(|_| 0),
+                },
+                Some(Operation::Write(fut, data)) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result.map(|_| data.len()),
+                },
+            };
+            self.op = None;
+            match result {
+                Ok(n) => {
+                    self.offset += n as u64;
+                    Poll::Ready(Ok(()))
+                }
+                Err(e) => Poll::Ready(Err(e)),
             }
-            self.closed = true; // stop Drop from issuing a second CLOSE
-            let h = std::mem::take(&mut self.handle);
-            self.session.close(&h).await.map_err(io_err)
+        }
+
+        fn check_open(&self) -> io::Result<()> {
+            if self.closed || self.closing {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "file is closing or closed",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -569,22 +803,42 @@ pub mod fs {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let this = &mut *self;
+            this.check_open()?;
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if matches!(this.op, Some(Operation::Write(..))) {
+                std::task::ready!(this.poll_abandoned(cx))?;
+            }
             if this.op.is_none() {
-                let want = buf.remaining().min(MAX_CHUNK) as u32;
+                let want = buf
+                    .remaining()
+                    .min(MAX_CHUNK)
+                    .min((u64::MAX - this.offset) as usize);
                 if want == 0 {
-                    return Poll::Ready(Ok(()));
+                    return Poll::Ready(Err(io::Error::other("file offset overflow")));
                 }
                 let s = this.session.clone();
                 let h = this.handle.clone();
                 let off = this.offset;
-                this.op = Some(Box::pin(async move {
-                    s.read_at(&h, off, want).await.map_err(io_err)
-                }));
+                this.op = Some(Operation::Read(
+                    Box::pin(async move { s.read_at(&h, off, want as u32).await.map_err(io_err) }),
+                    want,
+                ));
             }
-            let fut = this.op.as_mut().unwrap();
-            match Pin::new(fut).poll(cx) {
+            let Some(Operation::Read(fut, want)) = this.op.as_mut() else {
+                unreachable!()
+            };
+            let want = *want;
+            match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(data)) => {
                     this.op = None;
+                    if data.len() > want {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "oversized read response",
+                        )));
+                    }
                     // A hostile/buggy server may reply with more bytes than requested;
                     // clamp to the caller's buffer instead of letting put_slice panic.
                     let n = data.len().min(buf.remaining());
@@ -608,25 +862,41 @@ pub mod fs {
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             let this = &mut *self;
+            this.check_open()?;
             let n = buf.len().min(MAX_CHUNK);
+            if n == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let matches_write = match this.op.as_ref() {
+                Some(Operation::Write(_, data)) => buf.starts_with(data),
+                _ => false,
+            };
+            if this.op.is_some() && !matches_write {
+                std::task::ready!(this.poll_abandoned(cx))?;
+            }
             if this.op.is_none() {
+                if this.offset.checked_add(n as u64).is_none() {
+                    return Poll::Ready(Err(io::Error::other("file offset overflow")));
+                }
                 let s = this.session.clone();
                 let h = this.handle.clone();
                 let off = this.offset;
                 let chunk = buf[..n].to_vec();
-                this.op = Some(Box::pin(async move {
-                    s.write_at(&h, off, &chunk)
-                        .await
-                        .map(|_| Vec::new())
-                        .map_err(io_err)
-                }));
+                let sent = chunk.clone();
+                this.op = Some(Operation::Write(
+                    Box::pin(async move { s.write_at(&h, off, &chunk).await.map_err(io_err) }),
+                    sent,
+                ));
             }
-            let fut = this.op.as_mut().unwrap();
-            match Pin::new(fut).poll(cx) {
-                Poll::Ready(Ok(_)) => {
+            let Some(Operation::Write(fut, data)) = this.op.as_mut() else {
+                unreachable!()
+            };
+            let written = data.len();
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
                     this.op = None;
-                    this.offset += n as u64;
-                    Poll::Ready(Ok(n))
+                    this.offset += written as u64;
+                    Poll::Ready(Ok(written))
                 }
                 Poll::Ready(Err(e)) => {
                     this.op = None;
@@ -636,8 +906,9 @@ pub mod fs {
             }
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(())) // each write is a synchronous round-trip
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.check_open()?;
+            self.poll_abandoned(cx)
         }
 
         fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -645,7 +916,9 @@ pub mod fs {
             if this.closed {
                 return Poll::Ready(Ok(()));
             }
+            this.closing = true;
             if this.close_op.is_none() {
+                std::task::ready!(this.poll_abandoned(cx))?;
                 let s = this.session.clone();
                 let h = this.handle.clone();
                 this.close_op = Some(Box::pin(async move { s.close(&h).await.map_err(io_err) }));
@@ -666,11 +939,21 @@ pub mod fs {
 
     impl AsyncSeek for File {
         fn start_seek(mut self: Pin<&mut Self>, pos: SeekFrom) -> io::Result<()> {
+            self.check_open()?;
+            if self.op.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "operation pending; flush before seeking",
+                ));
+            }
             // Every read/write carries an explicit offset, so a seek is local-only.
             // `End` needs the size we don't track here.
             let new = match pos {
                 SeekFrom::Start(n) => n,
-                SeekFrom::Current(d) => self.offset.saturating_add_signed(d),
+                SeekFrom::Current(d) => self
+                    .offset
+                    .checked_add_signed(d)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"))?,
                 SeekFrom::End(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -691,6 +974,9 @@ pub mod fs {
             if self.closed {
                 return;
             }
+            // Cancel a partially transmitted request before scheduling CLOSE.
+            self.op = None;
+            self.close_op = None;
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 let s = self.session.clone();
                 let h = std::mem::take(&mut self.handle);
@@ -698,6 +984,105 @@ pub mod fs {
                     let _ = s.close(&h).await;
                 });
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU32;
+        use tokio::sync::{Mutex, oneshot};
+
+        fn file() -> File {
+            let inner = super::super::Inner {
+                writer: Mutex::new(Box::new(tokio::io::sink())),
+                pending: std::sync::Mutex::new(Default::default()),
+                next_id: AtomicU32::new(1),
+                extensions: Default::default(),
+            };
+            File::new(
+                SftpSession {
+                    inner: Arc::new(inner),
+                },
+                b"handle".to_vec(),
+            )
+        }
+
+        #[test]
+        fn pending_write_is_drained_by_flush_and_seek_is_rejected() {
+            let mut file = file();
+            let (tx, rx) = oneshot::channel();
+            file.op = Some(Operation::Write(
+                Box::pin(async move { rx.await.unwrap() }),
+                b"abc".to_vec(),
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut file).poll_flush(&mut cx).is_pending());
+            assert_eq!(
+                Pin::new(&mut file)
+                    .start_seek(SeekFrom::Start(4))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            tx.send(Ok(())).unwrap();
+            assert!(Pin::new(&mut file).poll_flush(&mut cx).is_ready());
+            assert_eq!(file.offset, 3);
+            assert!(
+                Pin::new(&mut file)
+                    .start_seek(SeekFrom::Current(-4))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn cancelled_read_then_write_does_not_consume_read_data() {
+            let mut file = file();
+            file.op = Some(Operation::Read(
+                Box::pin(async { Ok(b"hello".to_vec()) }),
+                5,
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut file).poll_write(&mut cx, b"x").is_pending());
+            assert_eq!(file.offset, 0);
+            assert!(matches!(file.op, Some(Operation::Write(..))));
+        }
+
+        #[test]
+        fn cancelled_write_then_read_advances_before_reading() {
+            let mut file = file();
+            file.op = Some(Operation::Write(
+                Box::pin(async { Ok(()) }),
+                b"abc".to_vec(),
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut bytes = [0; 4];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(
+                Pin::new(&mut file)
+                    .poll_read(&mut cx, &mut buf)
+                    .is_pending()
+            );
+            assert_eq!(file.offset, 3);
+            assert!(matches!(file.op, Some(Operation::Read(..))));
+        }
+
+        #[test]
+        fn shutdown_waits_for_write_and_blocks_new_io() {
+            let mut file = file();
+            let (tx, rx) = oneshot::channel();
+            file.op = Some(Operation::Write(
+                Box::pin(async move { rx.await.unwrap() }),
+                vec![1],
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut file).poll_shutdown(&mut cx).is_pending());
+            assert!(file.close_op.is_none());
+            tx.send(Ok(())).unwrap();
+            assert!(Pin::new(&mut file).poll_shutdown(&mut cx).is_pending());
+            assert_eq!(file.offset, 1);
+            assert!(Pin::new(&mut file).poll_write(&mut cx, b"x").is_ready());
         }
     }
 }
